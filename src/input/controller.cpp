@@ -1,5 +1,6 @@
 #include "controller.h"
 #include <orbis/libkernel.h>
+#include <cstdlib>
 
 Controller::Controller(OrbisUserServiceUserId userId) {
     padHandle_ = scePadOpen(userId, ORBIS_PAD_PORT_TYPE_STANDARD, 0, nullptr);
@@ -11,11 +12,33 @@ Controller::~Controller() {
 
 void Controller::poll() {
     prev_ = cur_;
-    if (padHandle_ < 0 || scePadReadState(padHandle_, &cur_) < 0) cur_ = {};
+    analogPress_ = 0;
+    if (padHandle_ < 0 || scePadReadState(padHandle_, &cur_) < 0 || !cur_.connected) cur_ = {};
+    constexpr uint32_t dpad = ORBIS_PAD_BUTTON_LEFT | ORBIS_PAD_BUTTON_RIGHT |
+                              ORBIS_PAD_BUTTON_UP | ORBIS_PAD_BUTTON_DOWN;
+    if (!cur_.connected || (cur_.buttons & dpad)) {
+        analogDirection_ = 0;
+        return;
+    }
+    const int x = cur_.leftStick.x - 128;
+    const int y = cur_.leftStick.y - 128;
+    const int threshold = analogDirection_ ? 38 : 57;
+    uint32_t direction = 0;
+    if (std::abs(x) >= threshold && std::abs(x) >= std::abs(y))
+        direction = x < 0 ? ORBIS_PAD_BUTTON_LEFT : ORBIS_PAD_BUTTON_RIGHT;
+    else if (std::abs(y) >= threshold)
+        direction = y < 0 ? ORBIS_PAD_BUTTON_UP : ORBIS_PAD_BUTTON_DOWN;
+
+    const auto now = sceKernelGetProcessTime();
+    if (direction && (direction != analogDirection_ || now >= nextAnalogPress_)) {
+        analogPress_ = direction;
+        nextAnalogPress_ = now + (direction == analogDirection_ ? 140000 : 350000);
+    }
+    analogDirection_ = direction;
 }
 
 bool Controller::pressed(uint32_t btn) const {
-    return (cur_.buttons & btn) && !(prev_.buttons & btn);
+    return (analogPress_ & btn) || ((cur_.buttons & btn) && !(prev_.buttons & btn));
 }
 
 bool Controller::held(uint32_t btn) const {
@@ -24,29 +47,4 @@ bool Controller::held(uint32_t btn) const {
 
 bool Controller::released(uint32_t btn) const {
     return !(cur_.buttons & btn) && (prev_.buttons & btn);
-}
-
-float Controller::leftX() const {
-    return (cur_.leftStick.x - 128) / 128.f;
-}
-
-float Controller::leftY() const {
-    return (cur_.leftStick.y - 128) / 128.f;
-}
-
-float Controller::rightX() const {
-    return (cur_.rightStick.x - 128) / 128.f;
-}
-
-float Controller::rightY() const {
-    return (cur_.rightStick.y - 128) / 128.f;
-}
-
-bool Controller::repeat(uint32_t btn) const {
-    if (pressed(btn)) return true;
-    if (!held(btn)) return false;
-    // Fire every ~150ms after 300ms initial delay
-    // Using frame count approximation (60fps → 9 frames delay, 9 frame repeat)
-    // Not using system time here to keep it simple
-    return false; // callers handle fine-grained repeat with their own timers
 }

@@ -2,6 +2,7 @@
 // PS4 Homebrew | OpenOrbis Toolchain | SDL2
 
 #include "nebula.h"
+#include "diagnostics.h"
 #include "ui/renderer.h"
 #include "ui/screens.h"
 #include "net/fetcher.h"
@@ -41,7 +42,9 @@ int main() {
         fprintf(stderr, "SDL_Init: %s\n", SDL_GetError());
         return 1;
     }
-    IMG_Init(IMG_INIT_PNG | IMG_INIT_JPG);
+    const int codecs = IMG_INIT_PNG | IMG_INIT_JPG;
+    const int initialized = IMG_Init(codecs);
+    if ((initialized & codecs) != codecs) diagnostic(IMG_GetError(), initialized);
     if (sceSysmoduleLoadModule(ORBIS_SYSMODULE_FREETYPE_OL) < 0 || TTF_Init() < 0) {
         fprintf(stderr, "FreeType initialization failed: %s\n", SDL_GetError());
         IMG_Quit();
@@ -86,7 +89,10 @@ int main() {
 
         // Main loop
         bool running = true;
+        bool reportedPresentationError = false;
+        unsigned slowFrames = 0;
         while (running) {
+            const auto frameStart = sceKernelGetProcessTime();
 
             SDL_Event ev;
             while (SDL_PollEvent(&ev)) {
@@ -110,8 +116,16 @@ int main() {
             gfx.clear();
             screens.render();
             gfx.present();
-            SDL_UpdateWindowSurface(window);
-            SDL_Delay(16);
+            if (SDL_UpdateWindowSurface(window) < 0 && !reportedPresentationError) {
+                diagnostic(SDL_GetError(), EIO);
+                reportedPresentationError = true;
+            }
+            const auto elapsed = sceKernelGetProcessTime() - frameStart;
+            if (elapsed > 33333 && ++slowFrames == 120) {
+                diagnostic("120 frames exceeded 33ms; latest frame duration in microseconds",
+                           static_cast<int>(elapsed));
+            }
+            if (elapsed < 16667) sceKernelUsleep(16667 - elapsed);
         }
 
         // Cleanup

@@ -115,15 +115,15 @@ python3 scripts/gen_manifest.py --output /tmp/nebula-manifest.json
 
 **To install an avatar:**
 1. Avatars → pick category → select item → ✕
-2. Preview screen → DOWNLOAD & INSTALL → ✕
+2. Preview screen → DOWNLOAD → ✕
 3. Wait for download (see Downloads screen)
-4. Press ✕ again to copy a single avatar or submit a pack installation request. Apply individual avatars through **Avatar Changer (LAPY)**.
+4. Select INSTALL to validate the local file and submit the copy or installation request. Apply individual avatars through **Avatar Changer (LAPY)**.
 
 **To install a theme:**
 1. Themes → pick category → select item → ✕
-2. Preview screen → DOWNLOAD & INSTALL → ✕
+2. Preview screen → DOWNLOAD → ✕
 3. Both PKG parts download automatically
-4. Press ✕ again after both downloads to submit the installation request.
+4. Select INSTALL after both downloads to validate the pair and submit the installation request.
 5. Go to **Settings → Themes → My Themes** to apply
 
 ---
@@ -134,3 +134,11 @@ Use a PS4 to check installation, launch, DualShock 4 input, fonts and previews,
 download redirects and TLS, write permissions under `/data`, and persistence
 across restart. For theme pairs and avatar packs, verify that the console
 accepts the installation request and that the content appears after installation.
+
+
+The six bundled previews are resized copies of the icon entries in the catalog's
+source packages. Other entries can supply a JPEG or PNG preview URL.
+
+If an operation fails on the console, copy `/data/NEBULAHUB/diagnostics.log`
+and record the exact system error and whether it happened during Download or
+Install. Installation requests are submitted separately after local validation.

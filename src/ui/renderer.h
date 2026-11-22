@@ -5,6 +5,7 @@
 #include <SDL2/SDL_image.h>
 #include <string>
 #include <unordered_map>
+#include <deque>
 
 struct Color { uint8_t r, g, b, a; };
 
@@ -50,8 +51,7 @@ public:
     std::string truncate(const std::string& str, int maxWidth, int size, bool bold = false);
 
     // Textures / images
-    SDL_Texture* loadTexture(const std::string& path);
-    void         freeTexture(const std::string& path);
+    SDL_Texture* loadTexture(const std::string& key, SDL_Surface* image);
     void         drawTexture(SDL_Texture* tex, int x, int y, int w, int h,
                              float alpha = 1.f);
     void         drawTextureRounded(SDL_Texture* tex, int x, int y, int w, int h,
@@ -72,6 +72,9 @@ private:
     // Font cache keyed by size+bold
     std::unordered_map<std::string, TTF_Font*> fonts_;
     TTF_Font* getFont(int size, bool bold);
+
+    std::unordered_map<std::string, SDL_Texture*> textCache_;
+    std::deque<std::string> textOrder_;
 
     // Texture cache keyed by path
     std::unordered_map<std::string, SDL_Texture*> texCache_;

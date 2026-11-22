@@ -83,7 +83,6 @@ private:
     float scrollY_  = 0.f;
     std::string selCategory_;
     std::vector<ContentEntry*> entries_;
-    std::unordered_map<std::string, SDL_Texture*> thumbs_;
 
     void refreshEntries(ScreenCtx& ctx);
     void drawCard(ScreenCtx& ctx, ContentEntry* e, int x, int y, bool focused);
