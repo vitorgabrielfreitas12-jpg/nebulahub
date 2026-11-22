@@ -23,9 +23,15 @@ extern "C" int sceSslTerm(int id);
 
 #include <algorithm>
 #include <orbis/libkernel.h>
-#include <SDL2/SDL_image.h>
+#include "../ui/image.h"
+#include "url.h"
+#include "transfer.h"
+#include <sys/statvfs.h>
+#include <sys/stat.h>
 
 #include <cstring>
+#include <cctype>
+#include <string_view>
 #include <cstdio>
 #include <fstream>
 #include <sstream>
@@ -40,7 +46,6 @@ extern "C" int sceSslTerm(int id);
 
 Fetcher::Fetcher() {
     writableDirectory(DATA_DIR);
-    downloadsWritable_ = writableDirectory(DOWNLOAD_DIR);
     cacheWritable_ = writableDirectory(CACHE_DIR) && writableDirectory(THUMB_DIR);
     try {
         worker_ = std::thread([this] {
@@ -49,7 +54,7 @@ Fetcher::Fetcher() {
             freeNet();
         });
     } catch (const std::system_error& error) {
-        diagnostic("Start network worker", error.code().value());
+        diagnostic("network", "Start worker", ErrorDomain::Posix, error.code().value());
         running_ = false;
     }
 }
@@ -60,9 +65,9 @@ Fetcher::~Fetcher() {
 }
 
 void Fetcher::initNet() {
-    diagnostic("Initialize HTTP services", 0);
+    diagnostic("network", "Initialize HTTP services", ErrorDomain::Event);
     const auto check = [this](const char* stage, int status) {
-        if (status < 0) networkError_ = diagnostic(stage, status);
+        if (status < 0) networkError_ = diagnostic("network", stage, ErrorDomain::Orbis, status);
         return status >= 0;
     };
     if (!check("load Net", sceSysmoduleLoadModuleInternal(ORBIS_SYSMODULE_INTERNAL_NET)) ||
@@ -78,12 +83,17 @@ void Fetcher::initNet() {
     if (!check("sceHttpInit", httpCtx_)) return;
     httpTemplate_ = sceHttpCreateTemplate(httpCtx_, "NebulaHub/1.0", ORBIS_HTTP_VERSION_1_1, 0);
     if (!check("sceHttpCreateTemplate", httpTemplate_)) return;
-    check("sceHttpSetAutoRedirect", sceHttpSetAutoRedirect(httpTemplate_, 1));
+    if (!check("sceHttpSetAutoRedirect", sceHttpSetAutoRedirect(httpTemplate_, 0))) {
+        sceHttpDeleteTemplate(httpTemplate_);
+        httpTemplate_ = -1;
+        return;
+    }
+    check("sceHttpSetResolveTimeOut", sceHttpSetResolveTimeOut(httpTemplate_, 5000000));
     check("sceHttpSetConnectTimeOut", sceHttpSetConnectTimeOut(httpTemplate_, 5000000));
     check("sceHttpSetSendTimeOut", sceHttpSetSendTimeOut(httpTemplate_, 5000000));
     check("sceHttpSetRecvTimeOut", sceHttpSetRecvTimeOut(httpTemplate_, 8000000));
     networkError_.clear();
-    diagnostic("HTTP initialized", 0);
+    diagnostic("network", "HTTP initialized", ErrorDomain::Event);
 }
 
 void Fetcher::freeNet() {
@@ -102,62 +112,107 @@ namespace {
 struct HttpRequest {
     int connection = -1;
     int request = -1;
-    ~HttpRequest() {
+    ~HttpRequest() { reset(); }
+
+    void reset() {
         if (request >= 0) sceHttpDeleteRequest(request);
         if (connection >= 0) sceHttpDeleteConnection(connection);
+        request = connection = -1;
     }
 
-    bool open(int httpTemplate, const std::string& url, std::string& error) {
-        const auto hostEnd = url.find_first_of("/?#", 8);
-        if (url.compare(0, 8, "https://") != 0 || url.size() <= 8 || hostEnd == 8 ||
-            url.find_first_of(" \r\n\t") != std::string::npos) {
-            error = diagnostic("Invalid HTTPS URL", EINVAL);
+    std::string redirectLocation() const {
+        char* headers = nullptr;
+        size_t size = 0;
+        if (sceHttpGetAllResponseHeaders(request, &headers, &size) < 0 ||
+            !headers || size > 64 * 1024) return {};
+        std::string_view lines(headers, size);
+        while (!lines.empty()) {
+            const auto end = lines.find('\n');
+            auto line = lines.substr(0, end);
+            if (end == std::string_view::npos) lines = {};
+            else lines.remove_prefix(end + 1);
+            const auto colon = line.find(':');
+            if (colon != 8) continue;
+            std::string name(line.substr(0, colon));
+            for (char& c : name) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+            if (name != "location") continue;
+            line.remove_prefix(colon + 1);
+            while (!line.empty() && (line.front() == ' ' || line.front() == '\t')) line.remove_prefix(1);
+            while (!line.empty() && (line.back() == ' ' || line.back() == '\r' ||
+                                      line.back() == '\t' || line.back() == '\0')) line.remove_suffix(1);
+            return std::string(line);
+        }
+        return {};
+    }
+
+    bool open(int httpTemplate, std::string url, std::string& error, const char* item) {
+        if (!validHttpsUrl(url)) {
+            error = diagnostic("network", "Invalid HTTPS URL", ErrorDomain::Application, 0, item);
             return false;
         }
-        connection = sceHttpCreateConnectionWithURL(httpTemplate, url.c_str(), false);
-        if (connection < 0) {
-            error = diagnostic("HTTP create connection", connection);
-            return false;
+        for (int redirect = 0; redirect <= 5; ++redirect) {
+            connection = sceHttpCreateConnectionWithURL(httpTemplate, url.c_str(), false);
+            if (connection < 0) {
+                error = diagnostic("network", "HTTP create connection", ErrorDomain::Orbis, connection, item);
+                return false;
+            }
+            request = sceHttpCreateRequestWithURL(connection, ORBIS_METHOD_GET, url.c_str(), 0);
+            if (request < 0) {
+                error = diagnostic("network", "HTTP create request", ErrorDomain::Orbis, request, item);
+                return false;
+            }
+            diagnostic("network", "HTTP send request", ErrorDomain::Event, 0, item);
+            int status = sceHttpSendRequest(request, nullptr, 0);
+            if (status < 0) {
+                error = diagnostic("network", "HTTP send / TLS", ErrorDomain::Orbis, status, item);
+                return false;
+            }
+            int response = 0;
+            status = sceHttpGetStatusCode(request, &response);
+            if (status < 0) {
+                error = diagnostic("network", "HTTP read status", ErrorDomain::Orbis, status, item);
+                return false;
+            }
+            if (response == 200) return true;
+            if (response != 301 && response != 302 && response != 303 && response != 307 && response != 308) {
+                error = "HTTP " + std::to_string(response);
+                diagnostic("network", "HTTP response", ErrorDomain::Http, response, item);
+                return false;
+            }
+            url = httpsRedirect(url, redirectLocation());
+            diagnostic("network", "HTTP redirect", ErrorDomain::Http, response, item);
+            if (url.empty()) {
+                error = diagnostic("network", "Invalid HTTPS redirect", ErrorDomain::Application, 0, item);
+                return false;
+            }
+            reset();
         }
-        request = sceHttpCreateRequestWithURL(connection, ORBIS_METHOD_GET, url.c_str(), 0);
-        if (request < 0) {
-            error = diagnostic("HTTP create request", request);
-            return false;
-        }
-        diagnostic("HTTP send request", 0);
-        int status = sceHttpSendRequest(request, nullptr, 0);
-        if (status < 0) {
-            error = diagnostic("HTTP send / TLS", status);
-            return false;
-        }
-        int response = 0;
-        status = sceHttpGetStatusCode(request, &response);
-        if (status < 0) {
-            error = diagnostic("HTTP read status", status);
-            return false;
-        }
-        if (response != 200) {
-            error = "HTTP " + std::to_string(response);
-            diagnostic("HTTP response", response);
-            return false;
-        }
-        return true;
+        error = diagnostic("network", "HTTP redirect limit reached", ErrorDomain::Application, 0, item);
+        return false;
     }
 };
 }
 
-bool Fetcher::httpGet(const std::string& url, std::string& body, size_t limit) {
-    if (httpTemplate_ < 0) return false;
+bool Fetcher::httpGet(const std::string& url, std::string& body, size_t limit,
+                      const char* item, std::string& error) {
+    if (httpTemplate_ < 0) {
+        error = networkError_.empty() ? "Network unavailable" : networkError_;
+        return false;
+    }
     HttpRequest request;
-    std::string error;
-    if (!request.open(httpTemplate_, url, error)) return false;
+    if (!request.open(httpTemplate_, url, error, item)) return false;
     char buffer[HTTP_BUF];
     body.clear();
     while (running_) {
         const int received = sceHttpReadData(request.request, buffer, sizeof(buffer));
-        if (received == 0) return !body.empty();
+        if (received == 0) {
+            if (!body.empty()) return true;
+            error = diagnostic("network", "Empty HTTP response", ErrorDomain::Application, 0, item);
+            return false;
+        }
         if (received < 0 || body.size() + static_cast<size_t>(received) > limit) {
-            diagnostic("HTTP read response", received < 0 ? received : EFBIG);
+            error = diagnostic("network", "Read response", received < 0 ? ErrorDomain::Orbis : ErrorDomain::Application,
+                               received < 0 ? received : EFBIG, item);
             return false;
         }
         body.append(buffer, received);
@@ -165,35 +220,57 @@ bool Fetcher::httpGet(const std::string& url, std::string& body, size_t limit) {
     return false;
 }
 
-bool Fetcher::httpDownload(DownloadJob& job) {
-    diagnostic(("Download start " + job.id).c_str(), 0);
-    if (!downloadsWritable_) {
-        job.errorMsg = "Download directory is not writable";
+bool Fetcher::httpDownload(DownloadJob& job, std::string& partial) {
+    const auto context = job.id + " " + job.destPath;
+    if (!validHttpsUrl(job.url)) {
+        job.errorMsg = "Download unavailable in this catalog";
         return false;
     }
+    if (!writableDirectory(DOWNLOAD_DIR, &job.errorMsg)) {
+        diagnostic("download", "Destination unavailable", ErrorDomain::Application, 0, job.id.c_str());
+        return false;
+    }
+    std::string temporary = job.destPath + ".part-XXXXXX";
+    const int fd = mkstemp(temporary.data());
+    if (fd < 0) {
+        job.errorMsg = diagnostic("download", "Create temporary file", ErrorDomain::Posix, errno, context.c_str());
+        return false;
+    }
+    partial = std::move(temporary);
+    FILE* file = fdopen(fd, "wb");
+    if (!file) {
+        const int code = errno;
+        close(fd);
+        job.errorMsg = diagnostic("download", "Open temporary stream", ErrorDomain::Posix, code, context.c_str());
+        return false;
+    }
+    std::unique_ptr<FILE, decltype(&fclose)> out(file, fclose);
+    diagnostic("download", "Destination ready", ErrorDomain::Event, 0, context.c_str());
     if (httpTemplate_ < 0) {
         job.errorMsg = networkError_.empty() ? "Network unavailable" : networkError_;
         return false;
     }
     HttpRequest request;
-    if (!request.open(httpTemplate_, job.url, job.errorMsg)) return false;
+    if (!request.open(httpTemplate_, job.url, job.errorMsg, job.id.c_str())) return false;
     const int req = request.request;
-    const auto expected = job.totalBytes;
+    const auto expected = job.catalogBytes;
     size_t contentLen = 0;
-    int lengthType = 0;
-    if (sceHttpGetResponseContentLength(req, &lengthType, &contentLen) >= 0 && contentLen > 0)
+    int lengthType = ORBIS_HTTP_CONTENTLEN_NOT_FOUND;
+    if (sceHttpGetResponseContentLength(req, &lengthType, &contentLen) >= 0 &&
+        lengthType == ORBIS_HTTP_CONTENTLEN_EXIST && contentLen > 0)
         job.totalBytes = contentLen;
     else
         contentLen = 0;
 
     if (expected && contentLen && expected != contentLen) {
-        job.errorMsg = diagnostic("Download length differs from catalog", EINVAL);
+        job.errorMsg = diagnostic("download", "HTTP length differs from catalog", ErrorDomain::Application, 0, context.c_str());
         return false;
     }
-    const std::string partial = job.destPath + ".part";
-    std::ofstream out(partial, std::ios::binary);
-    if (!out) {
-        job.errorMsg = diagnostic("Open download temporary file", errno);
+    const uint64_t limit = expected ? expected : contentLen;
+    struct statvfs space{};
+    if (limit && statvfs(DOWNLOAD_DIR, &space) == 0 &&
+        !fitsStorage(limit, space.f_frsize, space.f_bavail)) {
+        job.errorMsg = diagnostic("download", "Insufficient free space", ErrorDomain::Posix, ENOSPC, context.c_str());
         return false;
     }
 
@@ -204,15 +281,17 @@ bool Fetcher::httpDownload(DownloadJob& job) {
 
     while (running_ && publishProgress(job)) {
         read = sceHttpReadData(req, buf, sizeof(buf));
-        if (read < 0) { job.errorMsg = diagnostic("HTTP read download", read); break; }
+        if (read < 0) { job.errorMsg = diagnostic("download", "Read HTTP body", ErrorDomain::Orbis, read, context.c_str()); break; }
         if (read == 0) break;
 
-        const uint64_t limit = expected ? expected : contentLen;
         if (limit && job.bytesDown + static_cast<uint64_t>(read) > limit) {
-            job.errorMsg = diagnostic("Download exceeded expected size", EFBIG);
+            job.errorMsg = diagnostic("download", "Response exceeds expected size", ErrorDomain::Application, EFBIG, context.c_str());
             break;
         }
-        if (!out.write(buf, read)) { job.errorMsg = diagnostic("Write download temporary file", errno); break; }
+        if (const auto failure = writeStorage(out.get(), buf, read)) {
+            job.errorMsg = diagnostic("download", "Write temporary file", ErrorDomain::Posix, failure.code, context.c_str());
+            break;
+        }
         job.bytesDown += read;
 
         uint64_t now  = sceKernelGetProcessTime();
@@ -224,14 +303,16 @@ bool Fetcher::httpDownload(DownloadJob& job) {
         }
     }
 
-    out.close();
-    const bool complete = read == 0 && out && running_ && job.bytesDown > 0 &&
-        (!contentLen || job.bytesDown == contentLen) && (!expected || job.bytesDown == expected);
+    if (fclose(out.release()) != 0 && job.errorMsg.empty())
+        job.errorMsg = diagnostic("download", "Close temporary file", ErrorDomain::Posix, errno, context.c_str());
+    const bool complete = job.errorMsg.empty() && transferComplete(
+        read == 0, !running_ || !publishProgress(job), job.bytesDown, expected, contentLen);
     const bool package = job.destPath.size() > 4 &&
         job.destPath.compare(job.destPath.size() - 4, 4, ".pkg") == 0;
     if (complete && (!package || isCompletePackage(partial, job.bytesDown))) return true;
-    if (job.errorMsg.empty()) job.errorMsg = diagnostic("Incomplete or invalid download", EINVAL);
-    remove(partial.c_str());
+    if (job.errorMsg.empty() && running_ && publishProgress(job))
+        job.errorMsg = diagnostic("download", complete ? "Invalid package structure" : "Incomplete transfer",
+                                  ErrorDomain::Application, 0, context.c_str());
     return false;
 }
 
@@ -248,6 +329,7 @@ void Fetcher::workerLoop() {
             for (auto& job : queue_) {
                 if (job.state == InstallState::Queued && !job.paused) {
                     job.bytesDown = 0;
+                    job.totalBytes = job.catalogBytes;
                     job.errorMsg.clear();
                     job.state = InstallState::Downloading;
                     active = job;
@@ -264,16 +346,17 @@ void Fetcher::workerLoop() {
             try {
                 request();
             } catch (const std::exception&) {
-                diagnostic("Network request worker failed", EIO);
+                diagnostic("network", "Request worker failed", ErrorDomain::Application, EIO);
             }
         } else if (!active.id.empty()) {
             bool ok = false;
+            std::string partial;
             try {
-                ok = httpDownload(active);
+                ok = httpDownload(active, partial);
             } catch (const std::exception&) {
-                active.errorMsg = diagnostic("Download worker failed", EIO);
+                active.errorMsg = diagnostic("download", "Worker failed", ErrorDomain::Application, EIO, active.id.c_str());
             }
-            const auto partial = active.destPath + ".part";
+            int publishError = 0;
             bool published = false;
             {
                 std::lock_guard<std::mutex> lock(qMu_);
@@ -281,17 +364,24 @@ void Fetcher::workerLoop() {
                     if (job.generation == active.generation && job.state == InstallState::Downloading) {
                         if (ok && !job.paused && running_) {
                             published = rename(partial.c_str(), job.destPath.c_str()) == 0;
-                            if (!published) active.errorMsg = "Cannot publish download";
+                            if (!published) {
+                                publishError = errno;
+                                active.errorMsg = "Cannot publish download: " + std::string(strerror(publishError));
+                            }
                         }
                         job.errorMsg = job.paused ? "Paused. Resume restarts the transfer." : active.errorMsg;
+                        job.totalBytes = published && !active.totalBytes ? active.bytesDown : active.totalBytes;
+                        job.bytesDown = active.bytesDown;
                         job.speedBps = 0;
                         job.state = published ? InstallState::Done : InstallState::Error;
                         break;
                     }
                 }
             }
-            if (!published) remove(partial.c_str());
-            else diagnostic(("Download complete " + active.id).c_str(), 0);
+            if (!published && !partial.empty()) remove(partial.c_str());
+            if (publishError) diagnostic("download", "Publish package", ErrorDomain::Posix,
+                                         publishError, active.destPath.c_str());
+            if (published) diagnostic("download", "Download complete", ErrorDomain::Event, 0, active.id.c_str());
         } else {
             sceKernelUsleep(50000);
         }
@@ -314,27 +404,52 @@ bool Fetcher::publishProgress(const DownloadJob& active) {
 void Fetcher::fetchManifestAsync(const std::string& url) {
     if (url.empty()) return;
     std::lock_guard<std::mutex> lock(qMu_);
+    if (!running_) {
+        manifestStatus_ = "Network worker unavailable. Using local catalog.";
+        return;
+    }
+    manifestStatus_ = "Checking remote catalog";
     requests_.push_back([this, url] {
-        std::string body;
-        if (httpGet(url, body, 16 * 1024 * 1024)) {
-            std::lock_guard<std::mutex> lock(qMu_);
-            manifestCache_ = std::move(body);
+        std::string body, error;
+        std::unique_ptr<Database> catalog;
+        if (httpGet(url, body, 16 * 1024 * 1024, "catalog", error)) {
+            catalog = std::make_unique<Database>();
+            if (!catalog->importManifest(body)) {
+                error = diagnostic("catalog", "Invalid remote manifest", ErrorDomain::Application);
+                catalog.reset();
+            } else if (writableDirectory(DATA_DIR)) {
+                const char* temporary = DATA_DIR "manifest-cache.json.tmp";
+                std::ofstream cache(temporary, std::ios::binary);
+                cache.write(body.data(), body.size());
+                cache.close();
+                if (!cache || rename(temporary, DATA_DIR "manifest-cache.json") != 0) {
+                    const int code = errno;
+                    remove(temporary);
+                    diagnostic("catalog", "Publish validated manifest cache", ErrorDomain::Posix, code);
+                }
+            }
         }
+        std::lock_guard<std::mutex> lock(qMu_);
+        manifestStatus_ = catalog ? "Remote catalog validated" : error + ". Using local catalog.";
+        manifestCache_ = std::move(catalog);
     });
 }
 
-std::string Fetcher::takeManifest() {
+std::unique_ptr<Database> Fetcher::takeManifest() {
     std::lock_guard<std::mutex> lock(qMu_);
-    std::string result;
-    result.swap(manifestCache_);
-    return result;
+    return std::move(manifestCache_);
+}
+
+std::string Fetcher::manifestStatus() const {
+    std::lock_guard<std::mutex> lock(qMu_);
+    return manifestStatus_;
 }
 
 std::shared_ptr<SDL_Surface> Fetcher::thumbnail(const std::string& url, const std::string& cacheKey) {
     if (url.empty() || !running_) return {};
     const std::string bundled = "/app0/assets/images/" + cacheKey + ".png";
     const bool local = url == bundled;
-    if (!local && !cacheWritable_) return {};
+    if (!local && !validHttpsUrl(url)) return {};
     const auto key = cacheKey + "\n" + url;
     std::lock_guard<std::mutex> lock(qMu_);
     const auto found = thumbnails_.find(key);
@@ -348,41 +463,40 @@ std::shared_ptr<SDL_Surface> Fetcher::thumbnail(const std::string& url, const st
     thumbnails_.emplace(key, nullptr);
     requests_.push_back([this, url, cacheKey, key, local] {
         std::shared_ptr<SDL_Surface> image;
+        const auto tryFile = [](const std::string& path) {
+            struct stat info{};
+            if (stat(path.c_str(), &info) != 0 || !S_ISREG(info.st_mode) ||
+                info.st_size <= 0 || info.st_size > 2 * 1024 * 1024) return static_cast<SDL_Surface*>(nullptr);
+            std::ifstream file(path, std::ios::binary);
+            std::string body(static_cast<size_t>(info.st_size), '\0');
+            if (!file.read(body.data(), body.size())) return static_cast<SDL_Surface*>(nullptr);
+            return decodePreview(body);
+        };
         if (local) {
-            image.reset(IMG_Load(url.c_str()), SDL_FreeSurface);
+            image.reset(tryFile(url), SDL_FreeSurface);
         } else {
-            // The URL suffix differentiates a refreshed catalog image from older cache entries.
             uint32_t hash = 2166136261u;
             for (unsigned char c : url) hash = (hash ^ c) * 16777619u;
             const auto path = std::string(THUMB_DIR) + cacheKey + "-" + std::to_string(hash) + ".img";
-            struct stat info{};
-            if (stat(path.c_str(), &info) == 0 && info.st_size > 0 && info.st_size <= 2 * 1024 * 1024)
-                image.reset(IMG_Load(path.c_str()), SDL_FreeSurface);
+            if (cacheWritable_) image.reset(tryFile(path), SDL_FreeSurface);
             if (!image) {
-                std::string body;
-                if (!httpGet(url, body, 2 * 1024 * 1024)) return;
-                const bool jpeg = body.compare(0, 3, "\xff\xd8\xff") == 0;
-                const bool png = body.compare(0, 8, "\x89PNG\r\n\x1a\n") == 0;
-                if (!jpeg && !png) {
-                    diagnostic("Thumbnail is not JPEG or PNG", EINVAL);
-                    return;
-                }
-                SDL_RWops* source = SDL_RWFromConstMem(body.data(), static_cast<int>(body.size()));
-                if (source) image.reset(IMG_Load_RW(source, 1), SDL_FreeSurface);
-                if (image) {
+                std::string body, error;
+                if (!httpGet(url, body, 2 * 1024 * 1024, cacheKey.c_str(), error)) return;
+                image.reset(decodePreview(body), SDL_FreeSurface);
+                if (image && cacheWritable_) {
                     const auto partial = path + ".part";
                     std::ofstream file(partial, std::ios::binary);
                     file.write(body.data(), body.size());
                     file.close();
                     if (!file || rename(partial.c_str(), path.c_str()) != 0) {
-                        diagnostic("Write thumbnail cache", errno);
+                        diagnostic("preview", "Write cache", ErrorDomain::Posix, errno, cacheKey.c_str());
                         remove(partial.c_str());
                     }
                 }
             }
         }
-        if (!image || image->w <= 0 || image->h <= 0) {
-            diagnostic(IMG_GetError(), EINVAL);
+        if (!image) {
+            diagnostic("preview", "Open or decode PNG/JPEG", ErrorDomain::Application, 0, cacheKey.c_str());
             return;
         }
         const auto longest = std::max(image->w, image->h);
@@ -393,7 +507,7 @@ std::shared_ptr<SDL_Surface> Fetcher::thumbnail(const std::string& url, const st
                 SDL_CreateRGBSurfaceWithFormat(0, width, height, 32, SDL_PIXELFORMAT_RGBA32), SDL_FreeSurface);
             SDL_SetSurfaceBlendMode(image.get(), SDL_BLENDMODE_NONE);
             if (!resized || SDL_BlitScaled(image.get(), nullptr, resized.get(), nullptr) < 0) {
-                diagnostic(SDL_GetError(), EINVAL);
+                diagnostic("preview", "Resize image", ErrorDomain::Application, 0, cacheKey.c_str());
                 return;
             }
             image = std::move(resized);
@@ -408,6 +522,7 @@ std::shared_ptr<SDL_Surface> Fetcher::thumbnail(const std::string& url, const st
 void Fetcher::enqueue(DownloadJob job) {
     std::lock_guard<std::mutex> lk(qMu_);
     job.generation = ++generation_;
+    job.catalogBytes = job.totalBytes;
     if (!running_) {
         job.state = InstallState::Error;
         job.errorMsg = "Network worker unavailable";

@@ -1,23 +1,20 @@
 #!/usr/bin/env python3
-"""
-NEBULA HUB — Manifest Generator
-Fetches the archive.org ps4-permanent-themes-repository listing
-and generates a full manifest.json with every PKG pair detected.
+"""Build the Nebula Hub catalog from public Archive.org file indexes."""
 
-Usage:
-    python3 scripts/gen_manifest.py --output manifest/manifest.json
-"""
-
-import urllib.request
-import urllib.parse
-import json
-import re
 import argparse
-import time
+import hashlib
+import json
 import os
+from pathlib import Path
+import re
+import tempfile
+import urllib.parse
+import urllib.request
 
-THEMES_ARCHIVE  = "https://archive.org/download/ps4-permanent-themes-repository/"
-AVATARS_ARCHIVE = "https://archive.org/download/ps4-jb-avatars/"
+THEMES_ITEM = "ps4-permanent-themes-repository"
+AVATARS_ITEM = "ps4-jb-avatars"
+SEED = Path(__file__).resolve().parents[1] / "manifest" / "seed.json"
+
 
 ANIME_KEYWORDS = [
     "naruto","dragon ball","one piece","bleach","attack on titan","demon slayer",
@@ -46,10 +43,30 @@ def slugify(name):
     s = s.strip("_")
     return s[:40]
 
-def fetch_listing(url):
-    req = urllib.request.Request(url, headers={"User-Agent": "NebulaHub/1.0"})
-    with urllib.request.urlopen(req, timeout=30) as r:
-        return r.read().decode("utf-8")
+def fetch_index(item):
+    request = urllib.request.Request(f"https://archive.org/metadata/{item}",
+                                     headers={"User-Agent": "NebulaHub/1.0"})
+    with urllib.request.urlopen(request, timeout=30) as response:
+        data = response.read(16 * 1024 * 1024 + 1)
+    if len(data) > 16 * 1024 * 1024:
+        raise ValueError("archive index exceeds 16 MiB")
+    index = json.loads(data)
+    if not isinstance(index.get("files"), list):
+        raise ValueError(f"missing file index for {item}")
+    return {file["name"]: file for file in index["files"]
+            if isinstance(file.get("name"), str)
+            and file.get("private") not in (True, "true", "1")
+            and "/" not in file["name"] and "\\" not in file["name"]}
+
+
+def file_url(item, name):
+    return f"https://archive.org/download/{item}/{urllib.parse.quote(name, safe='')}"
+
+
+def file_size(record):
+    size = str(record.get("size", ""))
+    return int(size) if size.isdecimal() else 0
+
 
 def get_category(name):
     nl = name.lower()
@@ -74,196 +91,111 @@ def get_tags(name):
         tags.append("static")
     return list(dict.fromkeys(tags))[:8]
 
-def parse_theme_listing(html):
-    # Find all .pkg files in the listing
-    files = re.findall(r'href="([^"]+\.pkg)"', html)
-    # Decode URL-encoded names
-    files = [urllib.parse.unquote(f) for f in files
-             if not urllib.parse.urlsplit(f).netloc and "/" not in f]
-    return files
-
-def build_theme_pairs(files):
-    # Group _1.pkg and _2.pkg pairs
-    stubs   = {}  # name → filename
-    payloads = {}
-    for f in files:
-        if f.endswith("_1.pkg"):
-            base = f[:-6]
-            stubs[base] = f
-        elif f.endswith("_2.pkg"):
-            base = f[:-6]
-            payloads[base] = f
-    pairs = []
-    for base, stub in stubs.items():
-        if base in payloads:
-            pairs.append((base, stub, payloads[base]))
-    return pairs
-
-def generate_theme_entries(pairs, base_url):
+def build_catalog(seed, avatars, themes):
     entries = []
-    id_counter = 1
-    for base, stub_file, payload_file in pairs:
-        name = base.replace("_", " ").replace("-", " ").strip()
-        animated = "dynamic" in name.lower() or "animated" in name.lower()
-        cat, subcat = get_category(name)
-        tags = get_tags(name)
-        slug = slugify(name)
+    pairs = {}
+    duplicate_count = 0
+    avatar_seed = [entry for entry in seed["entries"] if entry["type"] == "avatar"]
+    theme_seed = [entry for entry in seed["entries"] if entry["type"] == "theme"]
 
-        stub_url    = base_url + urllib.parse.quote(stub_file)
-        payload_url = base_url + urllib.parse.quote(payload_file)
-
-        entry = {
-            "id":               f"th_{slug}_{id_counter:04d}",
-            "name":             name.title(),
-            "type":             "theme",
-            "category":         cat,
-            "subcategory":      subcat,
-            "animated":         animated,
-            "preview_url":      "",
-            "download_url":     "",
-            "pkg_stub_url":     stub_url,
-            "pkg_payload_url":  payload_url,
-            "file_size":        0,
-            "stub_size":        0,
-            "payload_size":     0,
-            "file_format":      "pkg_split",
-            "source":           "ps4-permanent-themes-repository / archive.org",
-            "install_method":   "pkg_install",
-            "tags":             tags
-        }
+    for original in avatar_seed:
+        entry = dict(original)
+        name = urllib.parse.unquote(urllib.parse.urlsplit(entry["download_url"]).path.rsplit("/", 1)[-1])
+        entry["download_url"] = file_url(AVATARS_ITEM, name) if name in avatars else ""
+        entry["file_size"] = file_size(avatars[name]) if name in avatars else 0
         entries.append(entry)
-        id_counter += 1
-    return entries
 
-def build_avatar_entries():
-    # Avatar entries are FPKG bulk packs (see Phase 1 findings)
-    return [
-        {
-            "id": "av_pack_001",
-            "name": "Extra Avatars Mega Pack",
-            "type": "avatar",
-            "category": "mixed",
-            "subcategory": "general",
-            "animated": False,
-            "preview_url": "",
-            "download_url": f"{AVATARS_ARCHIVE}Extra%20Avatars.pkg",
-            "pkg_stub_url": "",
-            "pkg_payload_url": "",
-            "file_size": 724535296,
-            "stub_size": 0,
-            "payload_size": 0,
-            "file_format": "xavatar_fpkg",
-            "source": "F1nnish / archive.org",
-            "install_method": "pkg_install",
-            "tags": ["mixed", "pack", "600+"]
-        },
-        {
-            "id": "av_pack_002",
-            "name": "Extra Avatars — Anime Pack",
-            "type": "avatar",
-            "category": "anime",
-            "subcategory": "mixed_anime",
-            "animated": False,
-            "preview_url": "",
-            "download_url": f"{AVATARS_ARCHIVE}Extra%20Avatars%20-%20Anime.pkg",
-            "pkg_stub_url": "",
-            "pkg_payload_url": "",
-            "file_size": 157286400,
-            "stub_size": 0,
-            "payload_size": 0,
-            "file_format": "xavatar_fpkg",
-            "source": "F1nnish / archive.org",
-            "install_method": "pkg_install",
-            "tags": ["anime", "pack", "200+", "naruto", "dragonball", "onepiece"]
-        },
-        {
-            "id": "av_pack_003",
-            "name": "Extra Avatars — PSN Originals",
-            "type": "avatar",
-            "category": "playstation",
-            "subcategory": "psn_originals",
-            "animated": False,
-            "preview_url": "",
-            "download_url": f"{AVATARS_ARCHIVE}Extra%20Avatars%20-%20PSN.pkg",
-            "pkg_stub_url": "",
-            "pkg_payload_url": "",
-            "file_size": 263192576,
-            "stub_size": 0,
-            "payload_size": 0,
-            "file_format": "xavatar_fpkg",
-            "source": "F1nnish / archive.org",
-            "install_method": "pkg_install",
-            "tags": ["psn", "official", "playstation", "pack", "300+"]
-        },
-        {
-            "id": "av_pack_004",
-            "name": "Extra Avatars — Games Pack",
-            "type": "avatar",
-            "category": "games",
-            "subcategory": "mixed_games",
-            "animated": False,
-            "preview_url": "",
-            "download_url": "",
-            "pkg_stub_url": "",
-            "pkg_payload_url": "",
-            "file_size": 0,
-            "stub_size": 0,
-            "payload_size": 0,
-            "file_format": "xavatar_fpkg",
-            "source": "F1nnish / archive.org",
-            "install_method": "pkg_install",
-            "tags": ["games", "pack", "godofwar", "spiderman", "uncharted"]
-        }
-    ]
+    for original in theme_seed:
+        entry = dict(original)
+        names = tuple(urllib.parse.unquote(urllib.parse.urlsplit(entry[field]).path.rsplit("/", 1)[-1])
+                      for field in ("pkg_stub_url", "pkg_payload_url"))
+        if all(name in themes for name in names):
+            pairs[names] = entry
+        else:
+            entry.update(pkg_stub_url="", pkg_payload_url="", stub_size=0, payload_size=0)
+            entries.append(entry)
+
+    # Only pair exact matching file stems. Similar titles may have unrelated
+    # licenses or regions. Standalone files are not inferred to be themes.
+    candidates = {}
+    for stub in sorted(themes):
+        if not stub.endswith("_1.pkg"):
+            continue
+        base = stub[:-6]
+        payload = base + "_2.pkg"
+        if payload not in themes:
+            continue
+        candidates[(stub, payload)] = base
+
+    by_hash = set()
+    for names in sorted(candidates, key=lambda pair: (pair not in pairs, pair)):
+        stub, payload = names
+        base = candidates[names]
+        hashes = (themes[stub].get("sha1"), themes[payload].get("sha1"))
+        if all(hashes) and hashes in by_hash:
+            duplicate_count += 1
+            continue
+        if all(hashes):
+            by_hash.add(hashes)
+        if names in pairs:
+            entry = pairs[names]
+        else:
+            digest = hashlib.sha256(base.encode("utf-8")).hexdigest()[:16]
+            category, subcategory = get_category(base)
+            entry = {
+                "id": f"th_{slugify(base)}_{digest}",
+                "name": base,
+                "type": "theme",
+                "category": category,
+                "subcategory": subcategory,
+                "animated": bool(re.search(r"\b(dynamic|animated)\b", base, re.I)),
+                "download_url": "",
+                "file_format": "pkg_split",
+                "source": "Internet Archive",
+                "install_method": "pkg_install",
+                "tags": get_tags(base),
+            }
+        preview = next((file_url(THEMES_ITEM, base + extension)
+                        for extension in (".jpg", ".jpeg", ".png") if base + extension in themes), "")
+        if preview or not entry.get("preview_url"):
+            entry["preview_url"] = preview
+        entry.update(pkg_stub_url=file_url(THEMES_ITEM, stub),
+                     pkg_payload_url=file_url(THEMES_ITEM, payload),
+                     stub_size=file_size(themes[stub]), payload_size=file_size(themes[payload]))
+        entries.append(entry)
+    return entries, duplicate_count
+
 
 def main():
-    parser = argparse.ArgumentParser(description="Generate NEBULA HUB manifest")
-    parser.add_argument("--output", default="manifest/manifest.json")
-    parser.add_argument("--offline", action="store_true",
-                        help="Skip network fetch, use seed data only")
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--output", default="manifest/manifest.json", type=Path)
+    parser.add_argument("--offline", action="store_true", help="Use the versioned seed only")
     args = parser.parse_args()
-
-    print("NEBULA HUB — Manifest Generator")
-    print("="*40)
-
-    theme_entries = []
-
-    if not args.offline:
-        print(f"Fetching theme listing from archive.org...")
-        try:
-            html = fetch_listing(THEMES_ARCHIVE)
-            files = parse_theme_listing(html)
-            print(f"  Found {len(files)} .pkg files")
-            pairs = build_theme_pairs(files)
-            print(f"  Built {len(pairs)} stub/payload pairs")
-            theme_entries = generate_theme_entries(pairs, THEMES_ARCHIVE)
-            print(f"  Generated {len(theme_entries)} theme entries")
-        except Exception as e:
-            print(f"  Warning: network fetch failed ({e}) — using seed data")
+    seed = json.loads(SEED.read_text(encoding="utf-8"))
+    if args.offline:
+        entries, duplicates = seed["entries"], 0
     else:
-        print("Offline mode — using seed entries only")
+        entries, duplicates = build_catalog(seed, fetch_index(AVATARS_ITEM), fetch_index(THEMES_ITEM))
 
-    avatar_entries = build_avatar_entries()
-    print(f"Avatar pack entries: {len(avatar_entries)}")
+    manifest = {"version": "1.0.1", "entries": entries}
+    manifest["total_avatars"] = sum(entry["type"] == "avatar" for entry in entries)
+    manifest["total_themes"] = len(entries) - manifest["total_avatars"]
+    manifest["duplicates_removed"] = duplicates
+    args.output.parent.mkdir(parents=True, exist_ok=True)
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=args.output.parent,
+                                         delete=False) as stream:
+            temporary = Path(stream.name)
+            json.dump(manifest, stream, indent=2, ensure_ascii=False)
+            stream.write("\n")
+        os.replace(temporary, args.output)
+    finally:
+        if temporary:
+            temporary.unlink(missing_ok=True)
+    print(f"{len(entries)} registros · {manifest['total_avatars']} avatares em pacotes · "
+          f"{manifest['total_themes']} temas · {duplicates} pares duplicados removidos")
 
-    all_entries = avatar_entries + theme_entries
-
-    manifest = {
-        "version":       "1.0.0",
-        "generated":     time.strftime("%Y-%m-%d"),
-        "total_avatars": sum(1 for e in all_entries if e["type"] == "avatar"),
-        "total_themes":  sum(1 for e in all_entries if e["type"] == "theme"),
-        "entries":       all_entries
-    }
-
-    os.makedirs(os.path.dirname(args.output) or ".", exist_ok=True)
-    with open(args.output, "w", encoding="utf-8") as f:
-        json.dump(manifest, f, indent=2, ensure_ascii=False)
-
-    print(f"\n✅ Manifest written → {args.output}")
-    print(f"   {manifest['total_avatars']} avatar entries")
-    print(f"   {manifest['total_themes']} theme entries")
-    print(f"   {len(all_entries)} total")
 
 if __name__ == "__main__":
     main()

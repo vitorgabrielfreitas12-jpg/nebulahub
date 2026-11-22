@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <vector>
 #include <unordered_map>
+#include <unordered_set>
 #include <functional>
 
 // ─────────────────────────────────────────────
@@ -45,9 +46,11 @@ public:
 
     void load(const std::string& path);
     void save(const std::string& path);
-    void importManifest(const std::string& jsonText);
-
-    bool isStale() const;   // manifest older than 24 h
+    bool importManifest(const std::string& jsonText);
+    bool loadManifestFile(const std::string& path);
+    void replaceCatalog(Database&& snapshot);
+    bool empty() const { return entries_.empty(); }
+    uint64_t revision() const { return revision_; }
 
     // Queries
     std::vector<ContentEntry*> all();
@@ -71,7 +74,9 @@ public:
 
 private:
     std::unordered_map<std::string, ContentEntry> entries_;
-    std::string  dbPath_;
+    std::unordered_set<std::string> favoriteIds_;
+    uint64_t revision_ = 0;
+    size_t avatarCount_ = 0;
     uint64_t     manifestTimestamp_ = 0;
 
     bool parseJson(const std::string& json, bool local);

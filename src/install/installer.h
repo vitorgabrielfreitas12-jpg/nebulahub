@@ -39,6 +39,7 @@ private:
     std::mutex mutex_;
     std::string resultId_;
     std::string result_;
+    std::string pendingTheme_;
 
     bool copyFile(const std::string& src, const std::string& dst);
     bool launchPkgInstall(const std::string& pkgPath, std::string& error);

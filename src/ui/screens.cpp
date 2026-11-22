@@ -5,15 +5,17 @@
 #include <cstdio>
 #include <algorithm>
 #include <sys/stat.h>
-#include "../install/package.h"
+#include "../net/url.h"
 
 // ─────────────────────────────────────────────
 //  ScreenManager
 // ─────────────────────────────────────────────
 
 ScreenManager::ScreenManager(Renderer& gfx, Database& db, Fetcher& net,
-                              Controller& ctrl, Installer& installer)
-    : ctx_{gfx, db, net, ctrl, installer, [this](ScreenID id, void* param) { push(id, param); }} {}
+                              Controller& ctrl, Installer& installer, bool remoteCatalog,
+                              std::string catalogConfigError)
+    : ctx_{gfx, db, net, ctrl, installer, [this](ScreenID id, void* param) { push(id, param); },
+           remoteCatalog, std::move(catalogConfigError)} {}
 
 void ScreenManager::push(ScreenID id, void* param) {
     stack_.push_back(makeScreen(id, param));
@@ -51,7 +53,7 @@ std::unique_ptr<Screen> ScreenManager::makeScreen(ScreenID id, void* param) {
 
 HomeScreen::HomeScreen() {
     tiles_ = {
-        { "AVATARS",    "1,000+ custom avatars",          ScreenID::AvatarLibrary, fromHex(0x7B2FFFFF) },
+        { "AVATARS",    "Avatar packs",          ScreenID::AvatarLibrary, fromHex(0x7B2FFFFF) },
         { "THEMES",     "Static & animated themes",       ScreenID::ThemeLibrary,  fromHex(0xFF5DB1FF) },
         { "SEARCH",     "Find anything instantly",        ScreenID::Search,        fromHex(0x2BFFB1FF) },
         { "DOWNLOADS",  "Track downloads",                ScreenID::Downloads,     fromHex(0xFFAA00FF) },
@@ -106,7 +108,7 @@ void HomeScreen::render(ScreenCtx& ctx) {
 
     // Stats
     char stats[128];
-    snprintf(stats, sizeof(stats), "%zu AVATARS  •  %zu THEMES",
+    snprintf(stats, sizeof(stats), "%zu AVATAR PACKS  •  %zu THEMES",
              ctx.db.totalAvatars(), ctx.db.totalThemes());
     auto sdim = gfx.measureText(stats, 18);
     gfx.text(stats, SCREEN_W - sdim.x - 80, 80, fromHex(COL_SUBTEXT), 18);
@@ -240,7 +242,11 @@ void LibraryScreen::drawCard(ScreenCtx& ctx, ContentEntry* e, int x, int y, bool
 }
 
 void LibraryScreen::update(ScreenCtx& ctx) {
-    if (entries_.empty()) refreshEntries(ctx);
+    if (!loaded_) {
+        refreshEntries(ctx);
+        categories_ = type_ == ContentType::Avatar ? ctx.db.avatarCategories() : ctx.db.themeCategories();
+        loaded_ = true;
+    }
 
     if (ctx.ctrl.pressed(ORBIS_PAD_BUTTON_SQUARE)) ctx.navigate(ScreenID::Search, nullptr);
     if (entries_.empty()) return;
@@ -284,9 +290,7 @@ void LibraryScreen::render(ScreenCtx& ctx) {
 
     // Category filters (top-right)
     // (simplified — categories shown as tab chips)
-    auto cats = (type_ == ContentType::Avatar)
-        ? ctx.db.avatarCategories()
-        : ctx.db.themeCategories();
+    const auto& cats = categories_;
     int cx = SCREEN_W - 60;
     for (int i = (int)cats.size() - 1; i >= 0; --i) {
         int cw2 = gfx.measureText(cats[i], 16).x + 20;
@@ -303,7 +307,11 @@ void LibraryScreen::render(ScreenCtx& ctx) {
     int startY = 110;
     int cols = 5;
 
-    for (int i = 0; i < (int)entries_.size(); ++i) {
+    const int rowHeight = cardH + padY;
+    const int firstRow = std::max(0, (-int(scrollY_) - cardH - 50) / rowHeight);
+    const int lastRow = std::max(firstRow, (SCREEN_H + 50 - startY - int(scrollY_)) / rowHeight + 1);
+    const int end = std::min(int(entries_.size()), lastRow * cols);
+    for (int i = firstRow * cols; i < end; ++i) {
         int row = i / cols;
         int col = i % cols;
         int x = startX + (int)scrollX_ + col * (cardW + padX);
@@ -465,6 +473,36 @@ void SearchScreen::render(ScreenCtx& ctx) {
 //  PreviewScreen
 // ─────────────────────────────────────────────
 
+namespace {
+std::string formatBytes(uint64_t bytes) {
+    constexpr double mib = 1024.0 * 1024;
+    constexpr double gib = 1024.0 * mib;
+    char formatted[40];
+    if (bytes >= gib) snprintf(formatted, sizeof(formatted), "%.2f GiB", bytes / gib);
+    else if (bytes >= mib) snprintf(formatted, sizeof(formatted), "%.1f MiB", bytes / mib);
+    else if (bytes >= 1024) snprintf(formatted, sizeof(formatted), "%.1f KiB", bytes / 1024.0);
+    else snprintf(formatted, sizeof(formatted), "%llu B", static_cast<unsigned long long>(bytes));
+    return formatted;
+}
+
+bool splitTheme(const ContentEntry& entry) {
+    return entry.type == ContentType::Theme && entry.fileFormat == "pkg_split";
+}
+
+bool canDownload(const ContentEntry& entry) {
+    if (splitTheme(entry)) return validHttpsUrl(entry.pkgStubUrl) && validHttpsUrl(entry.pkgPayloadUrl);
+    return validHttpsUrl(entry.downloadUrl) &&
+           (entry.type == ContentType::Theme ? entry.fileFormat == "pkg_theme" :
+            (entry.fileFormat == "xavatar_fpkg" || entry.fileFormat == "xavatar"));
+}
+
+std::string transferSize(const DownloadJob& job) {
+    if (!job.totalBytes) return formatBytes(job.bytesDown) + " baixados · Tamanho desconhecido";
+    return formatBytes(job.bytesDown) + " / " + formatBytes(job.totalBytes) + "  " +
+           std::to_string(int(job.progress() * 100)) + "%";
+}
+}
+
 PreviewScreen::PreviewScreen(ContentEntry* entry) : entry_(entry) {}
 
 void PreviewScreen::update(ScreenCtx& ctx) {
@@ -482,8 +520,14 @@ void PreviewScreen::update(ScreenCtx& ctx) {
         pending |= job.state == InstallState::Queued || job.state == InstallState::Downloading;
         if (job.state == InstallState::Error) error = job.errorMsg;
     }
-    if (downloading_ && !pending)
-        statusMsg_ = error.empty() ? "Transfer finished. Select Install to verify the files." : error;
+    if (downloading_ && !pending) {
+        bool completed = std::any_of(jobs.begin(), jobs.end(), [&](const auto& job) {
+            return (job.id == entry_->id || job.id == entry_->id + "_payload") &&
+                   job.state == InstallState::Done;
+        });
+        statusMsg_ = !error.empty() ? error : completed ? "Transfer finished. Select Install to verify the files."
+                                                      : "Transfer cancelled.";
+    }
     downloading_ = pending;
 
     if (!ctx.ctrl.pressed(ORBIS_PAD_BUTTON_CROSS)) return;
@@ -499,8 +543,7 @@ void PreviewScreen::update(ScreenCtx& ctx) {
 
     const bool avatar = entry_->type == ContentType::Avatar;
     const std::string base = std::string(DOWNLOAD_DIR) + entry_->id;
-    const bool avatarPkg = entry_->fileFormat == "xavatar_fpkg";
-    const auto avatarPath = base + (avatarPkg ? ".pkg" : ".xavatar");
+    const auto singlePath = base + (avatar && entry_->fileFormat == "xavatar" ? ".xavatar" : ".pkg");
     const auto stubPath = base + "_1.pkg";
     const auto payloadPath = base + "_2.pkg";
     if (ctx.installer.busy()) {
@@ -509,16 +552,15 @@ void PreviewScreen::update(ScreenCtx& ctx) {
     }
     if (btnIdx_ == 1) {
         ContentEntry requested = *entry_;
-        requested.localPath = avatarPath;
+        requested.localPath = singlePath;
         requested.localStubPath = stubPath;
         requested.localPayloadPath = payloadPath;
         statusMsg_ = ctx.installer.submit(std::move(requested))
             ? "Validating local files for installation…" : "Install unavailable: worker busy or failed to start.";
         return;
     }
-    if ((avatar && entry_->downloadUrl.empty()) ||
-        (!avatar && (entry_->pkgStubUrl.empty() || entry_->pkgPayloadUrl.empty()))) {
-        statusMsg_ = "Download unavailable in this catalog.";
+    if (!canDownload(*entry_)) {
+        statusMsg_ = "Download indisponível neste catálogo.";
         return;
     }
 
@@ -531,8 +573,8 @@ void PreviewScreen::update(ScreenCtx& ctx) {
         job.totalBytes = bytes;
         ctx.net.enqueue(std::move(job));
     };
-    if (avatar) {
-        enqueue(entry_->id, entry_->downloadUrl, avatarPath, entry_->fileSize);
+    if (!splitTheme(*entry_)) {
+        enqueue(entry_->id, entry_->downloadUrl, singlePath, entry_->fileSize);
     } else {
         enqueue(entry_->id + "_stub", entry_->pkgStubUrl, stubPath, entry_->stubSize);
         enqueue(entry_->id + "_payload", entry_->pkgPayloadUrl, payloadPath, entry_->payloadSize);
@@ -590,16 +632,11 @@ void PreviewScreen::render(ScreenCtx& ctx) {
         {"Source",     entry_->source},
         {"Format",     entry_->fileFormat},
     };
-    if (entry_->type == ContentType::Avatar) {
-        char szBuf[64];
-        snprintf(szBuf, sizeof(szBuf), "%.1f MB", entry_->fileSize / 1048576.f);
-        rows.push_back({"Size", szBuf});
-    } else {
-        char szBuf[64];
-        double total = (entry_->stubSize + entry_->payloadSize) / 1048576.0;
-        snprintf(szBuf, sizeof(szBuf), "%.1f MB", total);
-        rows.push_back({"Total Size", szBuf});
-    }
+    auto size = entry_->fileSize;
+    if (splitTheme(*entry_)) size = entry_->stubSize && entry_->payloadSize
+        ? entry_->stubSize + entry_->payloadSize : 0;
+    rows.push_back({"Tamanho", !canDownload(*entry_) ? "Indisponível" :
+                              size ? formatBytes(size) : "Tamanho desconhecido"});
 
     int ry = infoY + 110;
     for (auto& row : rows) {
@@ -624,7 +661,7 @@ void PreviewScreen::render(ScreenCtx& ctx) {
     // Status message
     if (!statusMsg_.empty()) {
         gfx.fillRoundRect(infoX, ry, infoW, 44, 8, fromHex(0x1A2A1AFF));
-        gfx.text(statusMsg_, infoX + 16, ry + 12, fromHex(COL_SUCCESS), 18);
+        gfx.text(gfx.truncate(statusMsg_, infoW - 32, 18), infoX + 16, ry + 12, fromHex(COL_TEXT), 18);
         ry += 56;
     }
 
@@ -641,7 +678,7 @@ void PreviewScreen::render(ScreenCtx& ctx) {
     for (int i = 0; i < 3; ++i) {
         int bw = gfx.measureText(btnLabels[i], 20, true).x + 48;
         bool sel = (i == btnIdx_);
-        Color bc = btnColors[i];
+        Color bc = i == 0 && !canDownload(*entry_) ? fromHex(COL_PANEL_ALT) : btnColors[i];
         if (!sel) bc.a = 100;
         gfx.fillRoundRect(bx, by, bw, bh, 10, bc, sel ? 1.0f : 0.4f);
         if (sel) {
@@ -657,9 +694,9 @@ void PreviewScreen::render(ScreenCtx& ctx) {
         if (j.id == entry_->id || j.id == entry_->id + "_stub" ||
             j.id == entry_->id + "_payload") {
             int py = by + bh + 30;
-            gfx.text(j.speedStr() + "  " + j.etaStr() + " remaining",
+            gfx.text(transferSize(j) + (j.state == InstallState::Downloading ? "  " + j.speedStr() + "  ETA: " + j.etaStr() : ""),
                      infoX, py, fromHex(COL_SUBTEXT), 18);
-            gfx.progressBar(infoX, py + 30, infoW, 12, j.progress(),
+            if (j.totalBytes) gfx.progressBar(infoX, py + 30, infoW, 12, j.progress(),
                             fromHex(0x222233FF), fromHex(COL_PROGRESS), 6);
             break;
         }
@@ -674,7 +711,8 @@ void DownloadsScreen::update(ScreenCtx& ctx) {
     auto jobs = ctx.net.queueSnapshot();
     if (ctx.ctrl.pressed(ORBIS_PAD_BUTTON_DOWN) && selIdx_ < (int)jobs.size()-1) selIdx_++;
     if (ctx.ctrl.pressed(ORBIS_PAD_BUTTON_UP)   && selIdx_ > 0) selIdx_--;
-    if (!jobs.empty() && selIdx_ < (int)jobs.size()) {
+    selIdx_ = std::max(0, std::min(selIdx_, int(jobs.size()) - 1));
+    if (!jobs.empty()) {
         auto& j = jobs[selIdx_];
         if (ctx.ctrl.pressed(ORBIS_PAD_BUTTON_SQUARE)) {
             if (j.paused) ctx.net.resume(j.id);
@@ -699,7 +737,7 @@ void DownloadsScreen::render(ScreenCtx& ctx) {
     }
 
     int ry = 120;
-    for (int i = 0; i < (int)jobs.size(); ++i) {
+    for (int i = std::max(0, selIdx_ - 5); i < (int)jobs.size(); ++i) {
         auto& j = jobs[i];
         bool sel = (i == selIdx_);
         Color bg = sel ? fromHex(0x1A1A30FF) : fromHex(COL_PANEL);
@@ -716,20 +754,14 @@ void DownloadsScreen::render(ScreenCtx& ctx) {
         if (j.state == InstallState::Done)        stc = fromHex(COL_SUCCESS);
         if (j.state == InstallState::Error)       stc = fromHex(COL_ERROR);
 
-        std::string info = stateStr[(int)j.state];
+        std::string info = j.paused ? "Pausado" : stateStr[static_cast<int>(j.state)];
         if (j.state == InstallState::Downloading)
             info += "  " + j.speedStr() + "  ETA: " + j.etaStr();
         if (j.state == InstallState::Error) info += "  " + j.errorMsg;
-        gfx.text(info, 90, ry + 38, stc, 18);
-
-        // Progress bar
-        gfx.progressBar(90, ry + 68, SCREEN_W - 200, 12, j.progress(),
-                        fromHex(0x222233FF), fromHex(COL_PROGRESS), 6);
-
-        // Percent
-        char pct[16];
-        snprintf(pct, sizeof(pct), "%d%%", (int)(j.progress() * 100));
-        gfx.text(pct, SCREEN_W - 100, ry + 60, fromHex(COL_TEXT), 18);
+        gfx.text(gfx.truncate(info, SCREEN_W - 180, 18), 90, ry + 37, stc, 18);
+        gfx.text(transferSize(j), 90, ry + 60, fromHex(COL_TEXT), 18);
+        if (j.totalBytes) gfx.progressBar(90, ry + 86, SCREEN_W - 200, 10, j.progress(),
+                                         fromHex(0x222233FF), fromHex(COL_PROGRESS), 5);
 
         ry += 126;
         if (ry > SCREEN_H - 80) break;
@@ -746,7 +778,10 @@ void DownloadsScreen::render(ScreenCtx& ctx) {
 // ─────────────────────────────────────────────
 
 void FavoritesScreen::update(ScreenCtx& ctx) {
-    favs_ = ctx.db.favorites();
+    if (revision_ != ctx.db.revision()) {
+        favs_ = ctx.db.favorites();
+        revision_ = ctx.db.revision();
+    }
     if (ctx.ctrl.pressed(ORBIS_PAD_BUTTON_DOWN) && selIdx_ < (int)favs_.size()-1) selIdx_++;
     if (ctx.ctrl.pressed(ORBIS_PAD_BUTTON_UP)   && selIdx_ > 0) selIdx_--;
     if (selIdx_ >= (int)favs_.size()) selIdx_ = std::max(0, (int)favs_.size() - 1);
@@ -766,7 +801,7 @@ void FavoritesScreen::render(ScreenCtx& ctx) {
     }
 
     int ry = 120;
-    for (int i = 0; i < (int)favs_.size(); ++i) {
+    for (int i = std::max(0, selIdx_ - 7); i < (int)favs_.size(); ++i) {
         bool sel = (i == selIdx_);
         Color bg = sel ? fromHex(0x1E1E34FF) : fromHex(COL_PANEL);
         gfx.fillRoundRect(60, ry, SCREEN_W - 120, 80, 10, bg);
@@ -786,12 +821,15 @@ void FavoritesScreen::render(ScreenCtx& ctx) {
 void SettingsScreen::update(ScreenCtx& ctx) {
     if (settings_.empty()) {
         settings_ = {
-            {"Manifest URL",    *MANIFEST_URL ? MANIFEST_URL : "Bundled catalog"},
+            {"Catálogo", ctx.remoteCatalog ? "HTTPS configurado" : "Catálogo local"},
+            {"Atualização", ""},
             {"Download Dir",    DOWNLOAD_DIR},
             {"Cache Dir",       CACHE_DIR},
             {"App Version",     APP_VERSION},
         };
     }
+    settings_[1].value = ctx.catalogConfigError.empty() ? ctx.net.manifestStatus() : ctx.catalogConfigError;
+    if (settings_[1].value.empty()) settings_[1].value = "Nenhuma atualização remota configurada";
     if (ctx.ctrl.pressed(ORBIS_PAD_BUTTON_DOWN) && selIdx_ < (int)settings_.size()-1) selIdx_++;
     if (ctx.ctrl.pressed(ORBIS_PAD_BUTTON_UP)   && selIdx_ > 0) selIdx_--;
 }

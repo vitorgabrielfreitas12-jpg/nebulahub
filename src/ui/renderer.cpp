@@ -158,7 +158,7 @@ SDL_Texture* Renderer::loadTexture(const std::string& key, SDL_Surface* image) {
     if (it != texCache_.end()) return it->second;
     if (!image) return nullptr;
     SDL_Texture* t = SDL_CreateTextureFromSurface(sdl_, image);
-    if (!t) diagnostic(SDL_GetError(), 0);
+    if (!t) diagnostic("preview", "Create texture", ErrorDomain::Application, 0, SDL_GetError());
     if (texCache_.size() >= 24) {
         SDL_DestroyTexture(texCache_.begin()->second);
         texCache_.erase(texCache_.begin());
