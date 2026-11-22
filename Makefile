@@ -23,6 +23,7 @@ SOURCES := $(wildcard src/*.cpp src/*/*.cpp)
 OBJECTS := $(patsubst src/%.cpp,$(BUILD)/%.o,$(SOURCES)) $(BUILD)/SDL_ttf.o
 METADATA := sce_sys/param.sfo sce_sys/icon0.png
 PAYLOAD := eboot.bin sce_sys/about/right.sprx sce_module/libc.prx sce_module/libSceFios2.prx assets/fonts/DejaVuSans.ttf assets/fonts/DejaVuSans-Bold.ttf assets/fonts/LICENSE assets/misc/manifest.json
+PAYLOAD += $(wildcard assets/images/*.png)
 FILES := $(METADATA) $(PAYLOAD)
 
 .DELETE_ON_ERROR:
@@ -86,6 +87,10 @@ $(STAGE)/assets/fonts/DejaVuSans-Bold.ttf: $(FONTS)/DejaVuSans-Bold.ttf
 	cp "$<" "$@"
 
 $(STAGE)/assets/fonts/LICENSE: /usr/share/doc/fonts-dejavu-core/copyright
+	mkdir -p "$(@D)"
+	cp "$<" "$@"
+
+$(STAGE)/assets/images/%.png: assets/images/%.png
 	mkdir -p "$(@D)"
 	cp "$<" "$@"
 

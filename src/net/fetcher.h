@@ -9,13 +9,16 @@
 #include <thread>
 #include <mutex>
 #include <deque>
-#include <unordered_set>
+#include <unordered_map>
+#include <memory>
+#include <SDL2/SDL_surface.h>
 
 // ─────────────────────────────────────────────
 //  Download job
 // ─────────────────────────────────────────────
 
 struct DownloadJob {
+    uint64_t generation = 0;
     std::string  id;           // content entry id
     std::string  url;
     std::string  destPath;
@@ -62,7 +65,7 @@ public:
 
     void fetchManifestAsync(const std::string& url);
     std::string takeManifest();
-    std::string thumbnail(const std::string& url, const std::string& cacheKey);
+    std::shared_ptr<SDL_Surface> thumbnail(const std::string& url, const std::string& cacheKey);
 
     // Download queue
     void enqueue(DownloadJob job);
@@ -78,7 +81,12 @@ public:
 
 private:
     std::deque<std::function<void()>> requests_;
-    std::unordered_set<std::string> thumbnailRequests_;
+    std::unordered_map<std::string, std::shared_ptr<SDL_Surface>> thumbnails_;
+    std::deque<std::string> thumbnailOrder_;
+    uint64_t generation_ = 0;
+    bool downloadsWritable_ = false;
+    bool cacheWritable_ = false;
+    std::string networkError_;
     std::string  manifestCache_;
 
     std::vector<DownloadJob> queue_;
@@ -88,7 +96,7 @@ private:
 
     void workerLoop();
     bool publishProgress(const DownloadJob& active);
-    bool httpGet(const std::string& url, std::string& body, std::string* errOut = nullptr);
+    bool httpGet(const std::string& url, std::string& body, size_t limit);
     bool httpDownload(DownloadJob& job);
 
     // PS4 native HTTP helpers

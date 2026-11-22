@@ -4,10 +4,12 @@
 #include <cstring>
 #include <cmath>
 #include <algorithm>
+#include "../diagnostics.h"
 
 Renderer::Renderer(SDL_Renderer* r) : sdl_(r) {}
 
 Renderer::~Renderer() {
+    for (auto& [k, t] : textCache_) SDL_DestroyTexture(t);
     for (auto& [k, f] : fonts_) TTF_CloseFont(f);
     for (auto& [k, t] : texCache_) SDL_DestroyTexture(t);
 }
@@ -36,7 +38,7 @@ void Renderer::clear(Color bg) {
 void Renderer::present() { SDL_RenderPresent(sdl_); }
 
 void Renderer::fillRect(int x, int y, int w, int h, Color c, float alpha) {
-    SDL_SetRenderDrawBlendMode(sdl_, SDL_BLENDMODE_BLEND);
+    SDL_SetRenderDrawBlendMode(sdl_, c.a == 255 && alpha == 1.f ? SDL_BLENDMODE_NONE : SDL_BLENDMODE_BLEND);
     SDL_SetRenderDrawColor(sdl_, c.r, c.g, c.b, (uint8_t)(c.a * alpha));
     SDL_Rect r{x, y, w, h};
     SDL_RenderFillRect(sdl_, &r);
@@ -51,32 +53,25 @@ void Renderer::drawRect(int x, int y, int w, int h, Color c, int thick) {
 }
 
 void Renderer::fillRoundRect(int x, int y, int w, int h, int radius, Color c, float alpha) {
-    // Simple approximation: filled rect + four corner fills
-    uint8_t a = (uint8_t)(c.a * alpha);
-    SDL_SetRenderDrawBlendMode(sdl_, SDL_BLENDMODE_BLEND);
-    SDL_SetRenderDrawColor(sdl_, c.r, c.g, c.b, a);
-    // Center rect (no corners)
-    SDL_Rect center{x + radius, y, w - 2*radius, h};
-    SDL_RenderFillRect(sdl_, &center);
-    SDL_Rect left{x, y + radius, radius, h - 2*radius};
-    SDL_RenderFillRect(sdl_, &left);
-    SDL_Rect right{x + w - radius, y + radius, radius, h - 2*radius};
-    SDL_RenderFillRect(sdl_, &right);
-    // Fill corners with circles (pixel-level, small radius)
-    for (int dy = 0; dy < radius; ++dy) {
-        for (int dx = 0; dx < radius; ++dx) {
-            if (dx*dx + dy*dy <= radius*radius) {
-                // Top-left
-                SDL_RenderDrawPoint(sdl_, x + radius - 1 - dx, y + radius - 1 - dy);
-                // Top-right
-                SDL_RenderDrawPoint(sdl_, x + w - radius + dx, y + radius - 1 - dy);
-                // Bottom-left
-                SDL_RenderDrawPoint(sdl_, x + radius - 1 - dx, y + h - radius + dy);
-                // Bottom-right
-                SDL_RenderDrawPoint(sdl_, x + w - radius + dx, y + h - radius + dy);
-            }
-        }
+    if (w <= 0 || h <= 0) return;
+    radius = std::max(0, std::min(radius, std::min(w, h) / 2));
+    if (!radius) {
+        fillRect(x, y, w, h, c, alpha);
+        return;
     }
+    SDL_Rect bands[65];
+    radius = std::min(radius, 32);
+    bands[0] = {x, y + radius, w, h - 2 * radius};
+    for (int row = 0; row < radius; ++row) {
+        const int dy = radius - row - 1;
+        const int inset = radius - static_cast<int>(std::sqrt(radius * radius - dy * dy));
+        bands[1 + row * 2] = {x + inset, y + row, w - 2 * inset, 1};
+        bands[2 + row * 2] = {x + inset, y + h - row - 1, w - 2 * inset, 1};
+    }
+    const auto opacity = static_cast<uint8_t>(c.a * alpha);
+    SDL_SetRenderDrawBlendMode(sdl_, opacity == 255 ? SDL_BLENDMODE_NONE : SDL_BLENDMODE_BLEND);
+    SDL_SetRenderDrawColor(sdl_, c.r, c.g, c.b, opacity);
+    SDL_RenderFillRects(sdl_, bands, 1 + 2 * radius);
 }
 
 void Renderer::drawLine(int x1, int y1, int x2, int y2, Color c) {
@@ -101,27 +96,29 @@ void Renderer::gradientH(int x, int y, int w, int h, Color left, Color right) {
 void Renderer::text(const std::string& str, int x, int y, Color c,
                     int size, bool bold, bool shadow) {
     if (str.empty()) return;
-    TTF_Font* f = getFont(size, bold);
-    if (!f) return;
-    if (shadow) {
-        SDL_Color sc{0, 0, 0, 160};
-        SDL_Surface* ss = TTF_RenderUTF8_Blended(f, str.c_str(), sc);
-        if (ss) {
-            SDL_Texture* st = SDL_CreateTextureFromSurface(sdl_, ss);
-            SDL_Rect dr{x+2, y+2, ss->w, ss->h};
-            SDL_RenderCopy(sdl_, st, nullptr, &dr);
-            SDL_DestroyTexture(st);
-            SDL_FreeSurface(ss);
+    if (shadow) text(str, x + 2, y + 2, {0, 0, 0, 160}, size, bold);
+    const std::string key = fontKey(size, bold) + ":" +
+        std::to_string(c.r | (uint32_t(c.g) << 8) | (uint32_t(c.b) << 16) | (uint32_t(c.a) << 24)) + ":" + str;
+    auto it = textCache_.find(key);
+    if (it == textCache_.end()) {
+        TTF_Font* font = getFont(size, bold);
+        if (!font) return;
+        SDL_Surface* surface = TTF_RenderUTF8_Blended(font, str.c_str(), {c.r, c.g, c.b, c.a});
+        if (!surface) return;
+        SDL_Texture* texture = SDL_CreateTextureFromSurface(sdl_, surface);
+        SDL_FreeSurface(surface);
+        if (!texture) return;
+        if (textCache_.size() >= 384) {
+            SDL_DestroyTexture(textCache_.at(textOrder_.front()));
+            textCache_.erase(textOrder_.front());
+            textOrder_.pop_front();
         }
+        textOrder_.push_back(key);
+        it = textCache_.emplace(key, texture).first;
     }
-    SDL_Color sc{c.r, c.g, c.b, c.a};
-    SDL_Surface* surf = TTF_RenderUTF8_Blended(f, str.c_str(), sc);
-    if (!surf) return;
-    SDL_Texture* tex = SDL_CreateTextureFromSurface(sdl_, surf);
-    SDL_Rect dr{x, y, surf->w, surf->h};
-    SDL_RenderCopy(sdl_, tex, nullptr, &dr);
-    SDL_DestroyTexture(tex);
-    SDL_FreeSurface(surf);
+    SDL_Rect rect{x, y, 0, 0};
+    SDL_QueryTexture(it->second, nullptr, nullptr, &rect.w, &rect.h);
+    SDL_RenderCopy(sdl_, it->second, nullptr, &rect);
 }
 
 SDL_Point Renderer::measureText(const std::string& str, int size, bool bold) {
@@ -156,25 +153,29 @@ std::string Renderer::truncate(const std::string& str, int maxWidth, int size, b
     return "…";
 }
 
-SDL_Texture* Renderer::loadTexture(const std::string& path) {
-    auto it = texCache_.find(path);
+SDL_Texture* Renderer::loadTexture(const std::string& key, SDL_Surface* image) {
+    auto it = texCache_.find(key);
     if (it != texCache_.end()) return it->second;
-    SDL_Texture* t = IMG_LoadTexture(sdl_, path.c_str());
-    if (t) texCache_[path] = t;
+    if (!image) return nullptr;
+    SDL_Texture* t = SDL_CreateTextureFromSurface(sdl_, image);
+    if (!t) diagnostic(SDL_GetError(), 0);
+    if (texCache_.size() >= 24) {
+        SDL_DestroyTexture(texCache_.begin()->second);
+        texCache_.erase(texCache_.begin());
+    }
+    texCache_[key] = t;
     return t;
-}
-
-void Renderer::freeTexture(const std::string& path) {
-    auto it = texCache_.find(path);
-    if (it == texCache_.end()) return;
-    SDL_DestroyTexture(it->second);
-    texCache_.erase(it);
 }
 
 void Renderer::drawTexture(SDL_Texture* tex, int x, int y, int w, int h, float alpha) {
     if (!tex) return;
     SDL_SetTextureAlphaMod(tex, (uint8_t)(255.f * alpha));
-    SDL_Rect r{x, y, w, h};
+    int sourceWidth = 0, sourceHeight = 0;
+    if (SDL_QueryTexture(tex, nullptr, nullptr, &sourceWidth, &sourceHeight) != 0 ||
+        sourceWidth <= 0 || sourceHeight <= 0) return;
+    const float scale = std::min(float(w) / sourceWidth, float(h) / sourceHeight);
+    const int width = int(sourceWidth * scale), height = int(sourceHeight * scale);
+    SDL_Rect r{x + (w - width) / 2, y + (h - height) / 2, width, height};
     SDL_RenderCopy(sdl_, tex, nullptr, &r);
 }
 

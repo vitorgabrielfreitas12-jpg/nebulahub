@@ -5,6 +5,7 @@
 #include <cstdio>
 #include <algorithm>
 #include <sys/stat.h>
+#include "../install/package.h"
 
 // ─────────────────────────────────────────────
 //  ScreenManager
@@ -27,15 +28,7 @@ void ScreenManager::update() {
 }
 
 void ScreenManager::render() {
-    // Render all screens, back screens dimmed
-    for (size_t i = 0; i < stack_.size(); ++i) {
-        stack_[i]->render(ctx_);
-        if (i < stack_.size() - 1) {
-            // Dim overlay
-            ctx_.gfx.fillRect(0, 0, SCREEN_W, SCREEN_H,
-                              fromHex(0x000000AA), 0.65f);
-        }
-    }
+    if (!stack_.empty()) stack_.back()->render(ctx_);
 }
 
 std::unique_ptr<Screen> ScreenManager::makeScreen(ScreenID id, void* param) {
@@ -193,22 +186,14 @@ void LibraryScreen::drawCard(ScreenCtx& ctx, ContentEntry* e, int x, int y, bool
     gfx.fillRoundRect(x, y, cw, ch, 12, bg);
 
     // Thumbnail area
-    SDL_Texture* thumb = nullptr;
-    auto it = thumbs_.find(e->id);
-    if (it != thumbs_.end()) thumb = it->second;
-    if (!thumb) {
-        const auto path = ctx.net.thumbnail(e->previewUrl, e->id);
-        if (!path.empty()) thumb = gfx.loadTexture(path);
-        if (thumb) thumbs_[e->id] = thumb;
-    }
+    const auto image = ctx.net.thumbnail(e->previewUrl, e->id);
+    SDL_Texture* thumb = gfx.loadTexture(e->id + e->previewUrl, image.get());
 
     if (thumb) {
         gfx.drawTexture(thumb, x+8, y+8, cw-16, 200);
     } else {
-        // Placeholder gradient
-        gfx.gradientH(x+8, y+8, cw-16, 200,
-                      fromHex(0x1A1A30FF), fromHex(0x2A1A40FF));
-        gfx.textCentered("⬛", x+8, y+8, cw-16, 200, fromHex(COL_SUBTEXT), 40);
+        gfx.fillRoundRect(x+8, y+8, cw-16, 200, 8, fromHex(0x241838FF));
+        gfx.textCentered("No preview", x+8, y+8, cw-16, 200, fromHex(COL_SUBTEXT), 18);
     }
 
     // Name
@@ -484,85 +469,76 @@ PreviewScreen::PreviewScreen(ContentEntry* entry) : entry_(entry) {}
 
 void PreviewScreen::update(ScreenCtx& ctx) {
     if (ctx.ctrl.pressed(ORBIS_PAD_BUTTON_RIGHT)) btnIdx_ = (btnIdx_ + 1) % 3;
-    if (ctx.ctrl.pressed(ORBIS_PAD_BUTTON_LEFT))  btnIdx_ = (btnIdx_ - 1 + 3) % 3;
+    if (ctx.ctrl.pressed(ORBIS_PAD_BUTTON_LEFT)) btnIdx_ = (btnIdx_ + 2) % 3;
 
+    const auto installResult = ctx.installer.takeResult(entry_->id);
+    if (!installResult.empty()) statusMsg_ = installResult;
+    const auto jobs = ctx.net.queueSnapshot();
+    bool pending = false;
+    std::string error;
+    for (const auto& job : jobs) {
+        if (job.id != entry_->id && job.id != entry_->id + "_stub" &&
+            job.id != entry_->id + "_payload") continue;
+        pending |= job.state == InstallState::Queued || job.state == InstallState::Downloading;
+        if (job.state == InstallState::Error) error = job.errorMsg;
+    }
+    if (downloading_ && !pending)
+        statusMsg_ = error.empty() ? "Transfer finished. Select Install to verify the files." : error;
+    downloading_ = pending;
+
+    if (!ctx.ctrl.pressed(ORBIS_PAD_BUTTON_CROSS)) return;
+    if (btnIdx_ == 2) {
+        ctx.db.toggleFavorite(entry_->id);
+        statusMsg_ = entry_->favorite ? "★ Favorited" : "Removed from favorites";
+        return;
+    }
     if (downloading_) {
-        const auto jobs = ctx.net.queueSnapshot();
-        downloading_ = std::any_of(jobs.begin(), jobs.end(), [this](const DownloadJob& job) {
-            const bool matches = job.id == entry_->id || job.id == entry_->id + "_stub" ||
-                                 job.id == entry_->id + "_payload";
-            return matches && (job.state == InstallState::Queued || job.state == InstallState::Downloading);
-        });
-        if (!downloading_) statusMsg_ = "Press Cross to install or retry the download.";
+        statusMsg_ = "The download is still pending.";
+        return;
     }
-    if (ctx.ctrl.pressed(ORBIS_PAD_BUTTON_CROSS) && !downloading_) {
-        if (btnIdx_ == 0) {
-            const auto exists = [](const std::string& path) {
-                struct stat info{};
-                return !path.empty() && stat(path.c_str(), &info) == 0 && info.st_size > 0;
-            };
-            const auto result = [this](bool ok, const std::string& message) {
-                statusMsg_ = ok ? "Installation request accepted" : message;
-                if (ok && entry_->type == ContentType::Avatar && entry_->fileFormat != "xavatar_fpkg")
-                    statusMsg_ = "Avatar copied. Apply it in Avatar Changer.";
-            };
-            const std::string base = std::string(DOWNLOAD_DIR) + entry_->id;
-            const std::string avatarPath = base + (entry_->fileFormat == "xavatar_fpkg" ? ".pkg" : ".xavatar");
-            const std::string stubPath = base + "_1.pkg";
-            const std::string payloadPath = base + "_2.pkg";
-            if (entry_->type == ContentType::Avatar && exists(avatarPath)) {
-                entry_->localPath = avatarPath;
-                ctx.installer.installAvatar(*entry_, result);
-                return;
-            }
-            if (entry_->type == ContentType::Theme && exists(stubPath) && exists(payloadPath)) {
-                entry_->localStubPath = stubPath;
-                entry_->localPayloadPath = payloadPath;
-                ctx.installer.installTheme(*entry_, result);
-                return;
-            }
-            const bool available = entry_->type == ContentType::Avatar
-                ? !entry_->downloadUrl.empty()
-                : !entry_->pkgStubUrl.empty() && !entry_->pkgPayloadUrl.empty();
-            if (!available) {
-                statusMsg_ = "Download unavailable in this catalog.";
-                return;
-            }
-            if (entry_->type == ContentType::Avatar) {
-                DownloadJob job;
-                job.id      = entry_->id;
-                job.url     = entry_->downloadUrl;
-                job.destPath = avatarPath;
-                job.totalBytes = entry_->fileSize;
-                job.state   = InstallState::Queued;
-                ctx.net.enqueue(job);
-                ctx.db.setInstallState(entry_->id, InstallState::Queued, job.destPath);
-                statusMsg_ = "Queued for download";
-                downloading_ = true;
-            } else {
-                // Theme: enqueue both PKG parts
-                DownloadJob j1, j2;
-                j1.id      = entry_->id + "_stub";
-                j1.url     = entry_->pkgStubUrl;
-                j1.destPath = stubPath;
-                j1.totalBytes = entry_->stubSize;
-                j2.id      = entry_->id + "_payload";
-                j2.url     = entry_->pkgPayloadUrl;
-                j2.destPath = payloadPath;
-                j2.totalBytes = entry_->payloadSize;
-                if (!exists(stubPath)) ctx.net.enqueue(j1);
-                if (!exists(payloadPath)) ctx.net.enqueue(j2);
-                entry_->localStubPath = j1.destPath;
-                entry_->localPayloadPath = j2.destPath;
-                ctx.db.setInstallState(entry_->id, InstallState::Queued);
-                statusMsg_ = "Theme queued — both parts downloading";
-                downloading_ = true;
-            }
-        } else if (btnIdx_ == 1) {
-            ctx.db.toggleFavorite(entry_->id);
-            statusMsg_ = entry_->favorite ? "★ Favorited" : "Removed from favorites";
-        }
+
+    const bool avatar = entry_->type == ContentType::Avatar;
+    const std::string base = std::string(DOWNLOAD_DIR) + entry_->id;
+    const bool avatarPkg = entry_->fileFormat == "xavatar_fpkg";
+    const auto avatarPath = base + (avatarPkg ? ".pkg" : ".xavatar");
+    const auto stubPath = base + "_1.pkg";
+    const auto payloadPath = base + "_2.pkg";
+    if (ctx.installer.busy()) {
+        statusMsg_ = "An installation request is still running.";
+        return;
     }
+    if (btnIdx_ == 1) {
+        ContentEntry requested = *entry_;
+        requested.localPath = avatarPath;
+        requested.localStubPath = stubPath;
+        requested.localPayloadPath = payloadPath;
+        statusMsg_ = ctx.installer.submit(std::move(requested))
+            ? "Validating local files for installation…" : "Install unavailable: worker busy or failed to start.";
+        return;
+    }
+    if ((avatar && entry_->downloadUrl.empty()) ||
+        (!avatar && (entry_->pkgStubUrl.empty() || entry_->pkgPayloadUrl.empty()))) {
+        statusMsg_ = "Download unavailable in this catalog.";
+        return;
+    }
+
+    const auto enqueue = [&](const std::string& id, const std::string& url,
+                             const std::string& path, uint64_t bytes) {
+        DownloadJob job;
+        job.id = id;
+        job.url = url;
+        job.destPath = path;
+        job.totalBytes = bytes;
+        ctx.net.enqueue(std::move(job));
+    };
+    if (avatar) {
+        enqueue(entry_->id, entry_->downloadUrl, avatarPath, entry_->fileSize);
+    } else {
+        enqueue(entry_->id + "_stub", entry_->pkgStubUrl, stubPath, entry_->stubSize);
+        enqueue(entry_->id + "_payload", entry_->pkgPayloadUrl, payloadPath, entry_->payloadSize);
+    }
+    statusMsg_ = "Queued for download";
+    downloading_ = true;
 }
 
 void PreviewScreen::render(ScreenCtx& ctx) {
@@ -577,13 +553,13 @@ void PreviewScreen::render(ScreenCtx& ctx) {
     gfx.fillRoundRect(artX - 8, artY - 8, artW + 16, artH + 16, 16,
                       fromHex(0x1A1A2EFF));
 
-    const auto path = ctx.net.thumbnail(entry_->previewUrl, entry_->id);
-    SDL_Texture* t = path.empty() ? nullptr : gfx.loadTexture(path);
+    const auto image = ctx.net.thumbnail(entry_->previewUrl, entry_->id);
+    SDL_Texture* t = gfx.loadTexture(entry_->id + entry_->previewUrl, image.get());
     if (t) {
         gfx.drawTexture(t, artX, artY, artW, artH);
     } else {
         gfx.fillRoundRect(artX, artY, artW, artH, 12, fromHex(0x1A1A30FF));
-        gfx.textCentered("Loading preview…", artX, artY, artW, artH,
+        gfx.textCentered("Preview unavailable or loading", artX, artY, artW, artH,
                          fromHex(COL_SUBTEXT), 24);
     }
 
@@ -653,7 +629,7 @@ void PreviewScreen::render(ScreenCtx& ctx) {
     }
 
     // Action buttons
-    static const char* btnLabels[] = { "DOWNLOAD & INSTALL", "★ FAVORITE", "BACK" };
+    static const char* btnLabels[] = { "DOWNLOAD", "INSTALL", "★ FAVORITE" };
     Color btnColors[] = {
         fromHex(COL_ACCENT),
         fromHex(0xFFDD00AA),
@@ -743,6 +719,7 @@ void DownloadsScreen::render(ScreenCtx& ctx) {
         std::string info = stateStr[(int)j.state];
         if (j.state == InstallState::Downloading)
             info += "  " + j.speedStr() + "  ETA: " + j.etaStr();
+        if (j.state == InstallState::Error) info += "  " + j.errorMsg;
         gfx.text(info, 90, ry + 38, stc, 18);
 
         // Progress bar
