@@ -8,6 +8,8 @@
 #include <stb/stb_image.h>
 
 #include <SDL2/SDL_endian.h>
+#include <algorithm>
+#include <array>
 #include <cstring>
 
 namespace {
@@ -66,4 +68,41 @@ SDL_Surface* loadPreviewFile(const std::string& path, PreviewError* error) {
         if (count < sizeof(buffer)) break;
     }
     return decodePreview(bytes, error);
+}
+
+SDL_Surface* downsamplePreview(const SDL_Surface& image, PreviewError* error) {
+    const auto longest = std::max(image.w, image.h);
+    if (image.w <= 0 || image.h <= 0 || longest <= previewMaxEdge ||
+        !image.format || image.format->BytesPerPixel != 4)
+        return fail(error, "Invalid RGBA surface for downsampling");
+    const auto width = std::max(1, image.w * previewMaxEdge / longest);
+    const auto height = std::max(1, image.h * previewMaxEdge / longest);
+    const auto& format = *image.format;
+    auto* target = SDL_CreateRGBSurface(0, width, height, 32, format.Rmask, format.Gmask, format.Bmask, format.Amask);
+    if (!target) return fail(error, "Create scaled preview surface", 0, SDL_GetError());
+
+    // Average each source area, weighting RGB by alpha to preserve translucent edges.
+    const auto* source = static_cast<const unsigned char*>(image.pixels);
+    auto* pixels = static_cast<unsigned char*>(target->pixels);
+    for (int y = 0; y < height; ++y) {
+        const int top = y * image.h / height;
+        const int bottom = (y + 1) * image.h / height;
+        for (int x = 0; x < width; ++x) {
+            const int left = x * image.w / width;
+            const int right = (x + 1) * image.w / width;
+            std::array<uint64_t, 4> channels{};
+            for (int sy = top; sy < bottom; ++sy) {
+                auto* sample = source + sy * image.pitch + left * 4;
+                for (int sx = left; sx < right; ++sx, sample += 4) {
+                    for (size_t c = 0; c < 3; ++c) channels[c] += sample[c] * sample[3];
+                    channels[3] += sample[3];
+                }
+            }
+            auto* pixel = pixels + y * target->pitch + x * 4;
+            for (size_t c = 0; c < 3; ++c)
+                pixel[c] = channels[3] ? channels[c] / channels[3] : 0;
+            pixel[3] = channels[3] / (uint64_t(bottom - top) * (right - left));
+        }
+    }
+    return target;
 }

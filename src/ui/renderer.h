@@ -1,5 +1,6 @@
 #pragma once
 #include "../nebula.h"
+#include "preview_texture.h"
 #include <SDL2/SDL.h>
 #include <SDL_ttf.h>
 #include <string>
@@ -50,11 +51,9 @@ public:
     std::string truncate(const std::string& str, int maxWidth, int size, bool bold = false);
 
     // Textures / images
-    SDL_Texture* loadTexture(const std::string& key, SDL_Surface* image);
-    void         drawTexture(SDL_Texture* tex, int x, int y, int w, int h,
-                             float alpha = 1.f);
-    void         drawTextureRounded(SDL_Texture* tex, int x, int y, int w, int h,
-                                    int radius, float alpha = 1.f);
+    bool drawPreview(const std::string& id, const std::string& source, SDL_Surface* image, SDL_Rect bounds) {
+        return previewTextures_.draw(id, source, image, bounds);
+    }
 
     // Progress bar
     void progressBar(int x, int y, int w, int h, float progress,
@@ -75,8 +74,7 @@ private:
     std::unordered_map<std::string, SDL_Texture*> textCache_;
     std::deque<std::string> textOrder_;
 
-    // Texture cache keyed by path
-    std::unordered_map<std::string, SDL_Texture*> texCache_;
+    PreviewTextures previewTextures_;
 
     static std::string fontKey(int size, bool bold) {
         return std::to_string(size) + (bold?"B":"R");

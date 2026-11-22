@@ -11,3 +11,7 @@ struct PreviewError {
 
 SDL_Surface* decodePreview(const std::string& bytes, PreviewError* error = nullptr);
 SDL_Surface* loadPreviewFile(const std::string& path, PreviewError* error = nullptr);
+
+inline constexpr int previewMaxEdge = 768;
+// The caller keeps ownership of the source surface.
+SDL_Surface* downsamplePreview(const SDL_Surface& image, PreviewError* error = nullptr);

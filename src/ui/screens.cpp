@@ -11,11 +11,10 @@ namespace {
 void drawPreview(ScreenCtx& ctx, const ContentEntry& entry, int x, int y, int w, int h) {
     const auto preview = ctx.net.thumbnail(entry.previewUrl, entry.id);
     auto& gfx = ctx.gfx;
-    auto* texture = gfx.loadTexture(entry.id + entry.previewUrl, preview.image.get());
     const char* caption = nullptr;
-    if (texture) {
-        gfx.drawTexture(texture, x, y, w, h);
-        if (preview.state == PreviewState::Illustration) caption = "Ilustração de categoria";
+    if (gfx.drawPreview(entry.id, entry.previewUrl, preview.image.get(), {x, y, w, h})) {
+        if (preview.state == PreviewState::Illustration || entry.previewUrl.rfind("/app0/", 0) == 0)
+            caption = "Ícone de categoria · sem prévia do item";
     } else {
         const bool avatar = entry.type == ContentType::Avatar;
         const auto accent = fromHex(avatar ? 0xBCA1EBFF : 0xA9C8EFFF);
@@ -36,7 +35,7 @@ void drawPreview(ScreenCtx& ctx, const ContentEntry& entry, int x, int y, int w,
     }
     if (caption) {
         gfx.fillRect(x, y + h - 32, w, 32, fromHex(0x11101CDD));
-        gfx.textCentered(caption, x, y + h - 32, w, 32, fromHex(COL_TEXT), 16);
+        gfx.textCentered(gfx.truncate(caption, w - 12, 16), x, y + h - 32, w, 32, fromHex(COL_TEXT), 16);
     }
 }
 }
@@ -555,7 +554,13 @@ void PreviewScreen::update(ScreenCtx& ctx) {
     }
     downloading_ = pending;
 
-    if (!ctx.ctrl.pressed(ORBIS_PAD_BUTTON_CROSS)) return;
+    const bool installSelected = btnIdx_ == 1;
+    const bool splitInstallSelected = installSelected && splitTheme(*entry_);
+    if (!splitInstallSelected) clearInstallProgress_ = false;
+    const bool cross = ctx.ctrl.pressed(ORBIS_PAD_BUTTON_CROSS);
+    const bool triangle = splitInstallSelected && ctx.ctrl.pressed(ORBIS_PAD_BUTTON_TRIANGLE);
+    const bool square = splitInstallSelected && ctx.ctrl.pressed(ORBIS_PAD_BUTTON_SQUARE);
+    if (!cross && !triangle && !square) return;
     if (btnIdx_ == 2) {
         ctx.db.toggleFavorite(entry_->id);
         statusMsg_ = entry_->favorite ? "★ Favorited" : "Removed from favorites";
@@ -575,12 +580,27 @@ void PreviewScreen::update(ScreenCtx& ctx) {
         statusMsg_ = "An installation request is still running.";
         return;
     }
-    if (btnIdx_ == 1) {
+    if (installSelected) {
+        if (square) {
+            clearInstallProgress_ = !clearInstallProgress_;
+            statusMsg_ = clearInstallProgress_
+                ? "Após checar o PS4, pressione △ para limpar o registro. □ volta."
+                : "Limpeza do registro cancelada.";
+            return;
+        }
+        if (clearInstallProgress_ && !triangle) {
+            clearInstallProgress_ = false;
+            statusMsg_ = "Limpeza do registro cancelada.";
+            return;
+        }
+        const auto command = clearInstallProgress_ ? InstallCommand::ClearProgress :
+                             triangle ? InstallCommand::ConfirmFirst : InstallCommand::Request;
+        clearInstallProgress_ = false;
         ContentEntry requested = *entry_;
         requested.localPath = singlePath;
         requested.localStubPath = stubPath;
         requested.localPayloadPath = payloadPath;
-        statusMsg_ = ctx.installer.submit(std::move(requested))
+        statusMsg_ = ctx.installer.submit(std::move(requested), command)
             ? "Validating local files for installation…" : "Install unavailable: worker busy or failed to start.";
         return;
     }
@@ -708,12 +728,17 @@ void PreviewScreen::render(ScreenCtx& ctx) {
         bx += bw + 20;
     }
 
+    if (splitTheme(*entry_) && btnIdx_ == 1) {
+        gfx.text("△ Enviar parte 2 após confirmar a parte 1 no PS4   □ Limpar registro",
+                 infoX, by + bh + 16, fromHex(COL_SUBTEXT), 18);
+    }
+
     // Download progress if active
     auto jobs = ctx.net.queueSnapshot();
     for (auto& j : jobs) {
         if (j.id == entry_->id || j.id == entry_->id + "_stub" ||
             j.id == entry_->id + "_payload") {
-            int py = by + bh + 30;
+            int py = by + bh + (splitTheme(*entry_) && btnIdx_ == 1 ? 54 : 30);
             gfx.text(transferSize(j) + (j.state == DownloadState::Downloading ? "  " + j.speedStr() + "  ETA: " + j.etaStr() : ""),
                      infoX, py, fromHex(COL_SUBTEXT), 18);
             if (j.totalBytes) gfx.progressBar(infoX, py + 30, infoW, 12, j.progress(),

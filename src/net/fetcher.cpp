@@ -519,6 +519,24 @@ void Fetcher::localPreviewLoop() {
     }
 }
 
+namespace {
+size_t surfaceBytes(const Preview& preview) {
+    return preview.image ? size_t(preview.image->pitch) * preview.image->h : 0;
+}
+}
+
+bool Fetcher::evictThumbnail() {
+    for (auto oldest = thumbnailOrder_.begin(); oldest != thumbnailOrder_.end(); ++oldest) {
+        const auto found = thumbnails_.find(*oldest);
+        if (found->second.state == PreviewState::Loading) continue;
+        thumbnailBytes_ -= surfaceBytes(found->second);
+        thumbnails_.erase(found);
+        thumbnailOrder_.erase(oldest);
+        return true;
+    }
+    return false;
+}
+
 Preview Fetcher::thumbnail(const std::string& url, const std::string& cacheKey) {
     if (url.empty()) return {};
     const std::string bundled = "/app0/assets/images/" + cacheKey + ".png";
@@ -531,84 +549,87 @@ Preview Fetcher::thumbnail(const std::string& url, const std::string& cacheKey) 
     if (local && !previewWorker_.joinable()) return {{}, PreviewState::Failed};
     auto& pending = local ? localPreviews_ : requests_;
     if (pending.size() >= 24) return {{}, PreviewState::Loading};
-    if (thumbnailOrder_.size() >= 48) {
-        thumbnails_.erase(thumbnailOrder_.front());
-        thumbnailOrder_.pop_front();
-    }
+    if (thumbnailOrder_.size() >= 48 && !evictThumbnail()) return {{}, PreviewState::Loading};
     thumbnailOrder_.push_back(key);
     thumbnails_.emplace(key, Preview{{}, PreviewState::Loading});
     pending.push_back([this, url, cacheKey, key, local] {
-        Preview result{{}, PreviewState::Failed};
-        const auto publish = [&] {
-            std::lock_guard<std::mutex> guard(qMu_);
-            const auto slot = thumbnails_.find(key);
-            if (slot != thumbnails_.end()) slot->second = std::move(result);
-        };
-        const auto logError = [&](const PreviewError& error, const std::string& path) {
-            const auto context = cacheKey + " path=" + path + " " + error.detail;
-            diagnostic("preview", error.stage ? error.stage : "Unknown image failure",
-                       error.ioError ? ErrorDomain::Posix : ErrorDomain::Event,
-                       error.ioError, context.c_str());
-        };
-        PreviewError imageError;
-        std::shared_ptr<SDL_Surface> image;
-        if (local) {
-            image.reset(loadPreviewFile(url, &imageError), SDL_FreeSurface);
-            if (!image) logError(imageError, url);
-        } else {
-            uint32_t hash = 2166136261u;
-            for (unsigned char c : url) hash = (hash ^ c) * 16777619u;
-            const auto path = std::string(THUMB_DIR) + cacheKey + "-" + std::to_string(hash) + ".img";
-            if (cacheWritable_) {
-                image.reset(loadPreviewFile(path, &imageError), SDL_FreeSurface);
-                if (!image && imageError.ioError != ENOENT) logError(imageError, path);
-            }
-            if (!image) {
-                std::string body, error;
-                if (!httpGet(url, body, 2 * 1024 * 1024, cacheKey.c_str(), error)) {
-                    diagnostic("preview", "Fetch remote image", ErrorDomain::Event, 0,
-                        (cacheKey + " source=" + diagnosticOrigin(url) + " " + error).c_str());
-                    publish();
-                    return;
+        const Preview failed{{}, PreviewState::Failed};
+        const auto load = [&]() -> Preview {
+            const auto logError = [&](const PreviewError& error, const std::string& path) {
+                const auto context = cacheKey + " path=" + path + " " + error.detail;
+                diagnostic("preview", error.stage ? error.stage : "Unknown image failure",
+                           error.ioError ? ErrorDomain::Posix : ErrorDomain::Event,
+                           error.ioError, context.c_str());
+            };
+            PreviewError imageError;
+            std::shared_ptr<SDL_Surface> image;
+            const char* source = local ? "bundled" : "network";
+            if (local) {
+                diagnostic("preview", "Open packaged illustration", ErrorDomain::Event, 0, cacheKey.c_str());
+                image.reset(loadPreviewFile(url, &imageError), SDL_FreeSurface);
+                if (!image) logError(imageError, url);
+            } else {
+                uint32_t hash = 2166136261u;
+                for (unsigned char c : url) hash = (hash ^ c) * 16777619u;
+                const auto path = std::string(THUMB_DIR) + cacheKey + "-" + std::to_string(hash) + ".img";
+                if (cacheWritable_) {
+                    image.reset(loadPreviewFile(path, &imageError), SDL_FreeSurface);
+                    if (image) source = "disk-cache";
+                    else if (imageError.ioError != ENOENT) logError(imageError, path);
                 }
-                image.reset(decodePreview(body, &imageError), SDL_FreeSurface);
-                if (!image) logError(imageError, diagnosticOrigin(url));
-                if (image && cacheWritable_) {
-                    const auto partial = path + ".part";
-                    std::ofstream file(partial, std::ios::binary);
-                    file.write(body.data(), body.size());
-                    file.close();
-                    if (!file || rename(partial.c_str(), path.c_str()) != 0) {
-                        const int code = errno;
-                        remove(partial.c_str());
-                        diagnostic("preview", "Write cache", ErrorDomain::Posix, code, path.c_str());
+                if (!image) {
+                    std::string body, error;
+                    if (!httpGet(url, body, 2 * 1024 * 1024, cacheKey.c_str(), error)) {
+                        diagnostic("preview", "Fetch remote image", ErrorDomain::Event, 0,
+                            (cacheKey + " source=" + diagnosticOrigin(url) + " " + error).c_str());
+                        return failed;
+                    }
+                    image.reset(decodePreview(body, &imageError), SDL_FreeSurface);
+                    if (!image) logError(imageError, diagnosticOrigin(url));
+                    if (image && cacheWritable_) {
+                        const auto partial = path + ".part";
+                        std::ofstream file(partial, std::ios::binary);
+                        file.write(body.data(), body.size());
+                        file.close();
+                        if (!file || rename(partial.c_str(), path.c_str()) != 0) {
+                            const int code = errno;
+                            remove(partial.c_str());
+                            diagnostic("preview", "Write cache", ErrorDomain::Posix, code, path.c_str());
+                        }
                     }
                 }
             }
-        }
-        if (image) {
-            const auto longest = std::max(image->w, image->h);
-            if (longest > 384) {
-                const int width = std::max(1, int(int64_t(image->w) * 384 / longest));
-                const int height = std::max(1, int(int64_t(image->h) * 384 / longest));
-                const auto* format = image->format;
-                std::shared_ptr<SDL_Surface> resized(SDL_CreateRGBSurface(
-                    0, width, height, 32, format->Rmask, format->Gmask, format->Bmask, format->Amask),
-                    SDL_FreeSurface);
-                SDL_SetSurfaceBlendMode(image.get(), SDL_BLENDMODE_NONE);
-                if (!resized || SDL_BlitScaled(image.get(), nullptr, resized.get(), nullptr) < 0) {
-                    diagnostic("preview", "Resize image", ErrorDomain::Event, 0,
-                               (cacheKey + " " + SDL_GetError()).c_str());
-                    publish();
-                    return;
+            if (image) {
+                const auto dimensions = [](const SDL_Surface& surface) {
+                    return std::to_string(surface.w) + "x" + std::to_string(surface.h);
+                };
+                const auto decoded = cacheKey + " source=" + source + " original=" + dimensions(*image);
+                diagnostic("preview", "Image decoded to RGBA surface", ErrorDomain::Event, 0, decoded.c_str());
+                if (std::max(image->w, image->h) > previewMaxEdge) {
+                    image.reset(downsamplePreview(*image, &imageError), SDL_FreeSurface);
+                    if (!image) {
+                        logError(imageError, source);
+                        return failed;
+                    }
                 }
-                image = std::move(resized);
+                const auto prepared = decoded + " cached=" + dimensions(*image);
+                diagnostic("preview", "Preview surface available", ErrorDomain::Event, 0, prepared.c_str());
+                return {std::move(image), local ? PreviewState::Illustration : PreviewState::Ready};
             }
-            result = {std::move(image), local ? PreviewState::Illustration : PreviewState::Ready};
-            diagnostic("preview", local ? "Loaded packaged illustration" : "Decoded remote or cached image",
-                       ErrorDomain::Event, 0, cacheKey.c_str());
+            return failed;
+        };
+        auto result = failed;
+        try {
+            result = load();
+        } catch (const std::exception& error) {
+            diagnostic("preview", "Prepare preview failed", ErrorDomain::Application, 0, error.what());
         }
-        publish();
+        std::lock_guard<std::mutex> guard(qMu_);
+        constexpr size_t maxSurfaceBytes = 24 * 1024 * 1024;
+        const auto bytes = surfaceBytes(result);
+        while (thumbnailBytes_ + bytes > maxSurfaceBytes && evictThumbnail()) {}
+        thumbnailBytes_ += bytes;
+        thumbnails_.at(key) = std::move(result);
     });
     if (local) previewReady_.notify_one();
     return {{}, PreviewState::Loading};

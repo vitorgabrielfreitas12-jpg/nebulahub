@@ -11,7 +11,7 @@ enum class ErrorDomain { Event, Posix, Orbis, Http, Application };
 
 inline std::string diagnostic(const char* subsystem, const char* operation,
                               ErrorDomain domain, int code = 0,
-                              const char* context = "") {
+                              const char* context = "", bool durable = false) {
     static std::mutex lock;
     std::lock_guard<std::mutex> guard(lock);
     char timestamp[32] = "time-unavailable";
@@ -38,6 +38,7 @@ inline std::string diagnostic(const char* subsystem, const char* operation,
         }
         if (out) {
             fprintf(out, "%s\n", line);
+            if (durable && fflush(out) == 0) fsync(fileno(out));
             fclose(out);
         }
     }

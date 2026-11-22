@@ -137,11 +137,18 @@ standalone PKGs require independent validation before being added as
 
 **To install a theme:**
 1. Themes → pick category → select item → ✕
-2. Preview screen → DOWNLOAD → ✕
-3. Wait for both downloads when the theme has two components.
-4. Select INSTALL to validate the files and submit part 1 or the standalone package.
-5. For a pair, wait until the PS4 confirms part 1, then select INSTALL again to submit part 2 in the same app session.
-6. Check **Settings → Themes → My Themes** after the console finishes.
+2. Choose **Download** if you need the files. For a pair, wait for both downloads.
+   Existing complete downloads in `/data/NEBULAHUB/downloads/` can be reused.
+3. Highlight **Install** and press ✕ to validate the local files and submit part 1
+   or the standalone package.
+4. For a pair, verify successful installation of part 1 in the PS4 notifications.
+   Then highlight **Install** and press △ to submit part 2. The local request
+   record survives app restarts. An accepted request is still pending on the PS4.
+5. Check the result of part 2 in the PS4 notifications and verify the theme in
+   **Settings → Themes → My Themes**.
+6. After checking that the console has finished processing the request, use
+   □ then △ with **Install** highlighted to clear the local request record.
+   This action only removes the record and leaves the downloaded PKGs available.
 
 ---
 
@@ -153,9 +160,11 @@ across restart. For theme pairs and avatar packs, verify that the console
 accepts the installation request and that the content appears after installation.
 
 
-The six packaged PNGs are original category illustrations. Three catalog
-entries link to matching JPEGs in the archive. Other entries show a fallback.
-Decoding and HTTP run outside the render loop.
+The six packaged PNGs contain two category icons, one for avatars and the other
+for themes. Three catalog entries link to matching 1920×1080 JPEGs. The app
+keeps the original compressed file in the disk cache and prepares a 768×432
+surface for rendering. Decoding and resizing run on workers. Texture
+creation and drawing run on the main thread.
 
 Transfers use verified EOF and a temporary file before publishing. The app
 reads Content-Length from the actual GET when supplied. Pause, cancellation
@@ -165,7 +174,10 @@ validator and range support.
 
 If an operation fails on the console, copy `/data/NEBULAHUB/diagnostics.log`
 and record the exact system error and whether it happened during Download or
-Install. Installation requests are submitted separately after local validation.
+Install. When the log has rotated, also copy `diagnostics.previous.log`. During
+installation the log records staging, service symbol resolution, initialization,
+submission and termination. An entry ending in `begin` identifies the last
+operation started if its corresponding return entry is missing.
 
 
 ### Download diagnostics
@@ -188,5 +200,6 @@ For a short console test, the first part of **Azure Earth Orbital Remastered -
 Dynamic** is 1 MiB. It should reach Completed before the second part starts.
 Only submit installation after both parts pass. For remote preview testing use
 **TEKKEN 7**, **PAC-MAN Championship Edition 2** or **TERA - Anniversary**.
-Other entries may show an illustration while loading, when no individual preview
-is listed, or after a preview failure.
+For offline icon testing use **Horizon Zero Dawn**, **Ghost of Tsushima**,
+**Dark Souls III**, **Mega Avatar Pack**, **Anime Avatar Pack** or **PSN Originals**.
+The caption identifies entries with a bundled category icon.
