@@ -250,9 +250,7 @@ std::vector<ContentEntry*> Database::search(const std::string& query,
                                               bool animatedOnly) {
     std::vector<ContentEntry*> out;
     for (auto& [id, e] : entries_) {
-        if (e.type != filter && filter != (ContentType)255) {
-            // ContentType 255 = "all" (cast hack)
-        }
+        if (filter != (ContentType)255 && e.type != filter) continue;
         if (animatedOnly && !e.animated) continue;
         bool match = contains(e.name, query)
                   || contains(e.category, query)
