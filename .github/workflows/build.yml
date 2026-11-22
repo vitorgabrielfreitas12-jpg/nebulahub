@@ -26,6 +26,8 @@ jobs:
           git clone --depth 1 \
             https://github.com/OpenOrbis/OpenOrbis-PS4-Toolchain.git openorbis
           find openorbis/bin/linux -type f -exec chmod +x {} \; 2>/dev/null || true
+          echo "Verificando arquivos do OpenOrbis:"
+          find openorbis -type f \( -name "clang++" -o -name "clang" \) -print
           echo "OO_PS4_TOOLCHAIN=$(pwd)/openorbis" >> $GITHUB_ENV
 
       - name: Build PkgTool.Core
