@@ -521,6 +521,13 @@ void PreviewScreen::update(ScreenCtx& ctx) {
                 ctx.installer.installTheme(*entry_, result);
                 return;
             }
+            const bool available = entry_->type == ContentType::Avatar
+                ? !entry_->downloadUrl.empty()
+                : !entry_->pkgStubUrl.empty() && !entry_->pkgPayloadUrl.empty();
+            if (!available) {
+                statusMsg_ = "Download unavailable in this catalog.";
+                return;
+            }
             if (entry_->type == ContentType::Avatar) {
                 DownloadJob job;
                 job.id      = entry_->id;

@@ -72,7 +72,7 @@ int main() {
         const std::string dbPath = std::string(DATA_DIR) + "db.json";
         db.load(dbPath);
         const bool refreshManifest = db.isStale();
-        if (db.all().empty()) {
+        if (db.all().empty() || !*MANIFEST_URL) {
             std::ifstream manifest("/app0/assets/misc/manifest.json");
             std::ostringstream text;
             text << manifest.rdbuf();

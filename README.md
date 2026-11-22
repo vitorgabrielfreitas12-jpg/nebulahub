@@ -91,7 +91,9 @@ checks the PKG and compares its extracted payload with the staged files.
 
 The packaged manifest is available on first launch without a catalog server.
 Set `MANIFEST_URL` in `src/nebula.h` to your HTTPS manifest URL to enable refreshes.
-The catalog entries still need reachable media URLs for previews and downloads.
+The catalog keeps entries with unavailable downloads so their IDs and favorites
+remain stable. Download URLs and sizes in the bundled catalog were checked
+against the archive indexes.
 
 To generate a separate manifest from the archive listing:
 
