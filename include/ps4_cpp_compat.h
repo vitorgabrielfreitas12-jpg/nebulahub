@@ -8,6 +8,7 @@
 #endif
 
 #include <time.h>
+#include <stdlib.h>
 
 /*
  * libc++'s FreeBSD threading shim expects this POSIX declaration.
@@ -18,6 +19,8 @@
 extern "C" {
 #endif
 int nanosleep(const struct timespec *requested, struct timespec *remaining);
+/* libc++ uses this POSIX allocation interface for over-aligned new. */
+int posix_memalign(void **memptr, size_t alignment, size_t size);
 #ifdef __cplusplus
 }
 #endif
