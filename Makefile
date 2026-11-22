@@ -1,6 +1,6 @@
 TITLE := NEBULA HUB
 TITLE_ID := NEBU00001
-VERSION := 01.00
+VERSION := 01.01
 CONTENT_ID := IV0000-NEBU00001_00-NEBULAHUB0000001
 OO_PS4_TOOLCHAIN ?= $(CURDIR)/.deps/OpenOrbis/PS4Toolchain
 SDL_TTF_SRC ?= .deps/SDL_ttf.c
@@ -18,16 +18,17 @@ STAGE := $(BUILD)/pkg
 CROSS := --target=x86_64-pc-freebsd12-elf --sysroot="$(SDK)" -nostdlibinc -fPIC -funwind-tables -D__ORBIS__ -D_GNU_SOURCE
 CXXFLAGS := $(CROSS) -isystem "$(SDK)/include/c++/v1" -isystem "$(SDK)/include" -I.deps -isystem "$(SDK)/include/SDL2" -std=c++17 -O2 -Wall -Wextra
 LDFLAGS := -m elf_x86_64 -pie --script "$(SDK)/link.x" --eh-frame-hdr -z max-page-size=0x4000 -L"$(SDK)/lib"
-LIBS := -lSDL2_image -lSDL2 -lSceFreeType -lSceUserService -lSceAppInstUtil -lSceVideoOut -lSceAudioOut -lScePad -lSceSysmodule -lSceNet -lSceHttp -lSceSsl -lc++ -lc++abi -lunwind -lc -lkernel
+LIBS := -lSDL2 -lSceFreeType -lSceUserService -lSceAppInstUtil -lSceVideoOut -lSceAudioOut -lScePad -lSceSysmodule -lSceNet -lSceHttp -lSceSsl -lc++ -lc++abi -lunwind -lc -lkernel
 SOURCES := $(wildcard src/*.cpp src/*/*.cpp)
 OBJECTS := $(patsubst src/%.cpp,$(BUILD)/%.o,$(SOURCES)) $(BUILD)/SDL_ttf.o
 METADATA := sce_sys/param.sfo sce_sys/icon0.png
 PAYLOAD := eboot.bin sce_sys/about/right.sprx sce_module/libc.prx sce_module/libSceFios2.prx assets/fonts/DejaVuSans.ttf assets/fonts/DejaVuSans-Bold.ttf assets/fonts/LICENSE assets/misc/manifest.json
-PAYLOAD += $(wildcard assets/images/*.png)
+PREVIEWS := av_pack_001 av_pack_002 av_pack_003 th_dark_souls_3_static th_ghost_tsushima_dyn th_horizon_zd_dyn
+PAYLOAD += $(addprefix assets/images/,$(addsuffix .png,$(PREVIEWS)))
 FILES := $(METADATA) $(PAYLOAD)
 
 .DELETE_ON_ERROR:
-.PHONY: all clean verify
+.PHONY: all clean verify test
 all: nebulahub.pkg
 
 $(BUILD)/%.o: src/%.cpp Makefile
@@ -90,9 +91,15 @@ $(STAGE)/assets/fonts/LICENSE: /usr/share/doc/fonts-dejavu-core/copyright
 	mkdir -p "$(@D)"
 	cp "$<" "$@"
 
-$(STAGE)/assets/images/%.png: assets/images/%.png
+$(STAGE)/assets/images/av_%.png: Makefile
 	mkdir -p "$(@D)"
-	cp "$<" "$@"
+	convert -size 256x256 gradient:'#281849-#6D3DB0' -fill '#DCC8FF' \
+	  -draw 'circle 128,92 128,61 roundrectangle 61,135 195,193 28,28' -strip PNG32:"$@"
+
+$(STAGE)/assets/images/th_%.png: Makefile
+	mkdir -p "$(@D)"
+	convert -size 256x256 gradient:'#172A4B-#355882' -fill '#C5DEFF' \
+	  -draw 'circle 176,84 176,67 polygon 34,184 96,109 139,158 165,133 222,184' -strip PNG32:"$@"
 
 $(STAGE)/assets/misc/manifest.json: manifest/manifest.json
 	mkdir -p "$(@D)"
@@ -123,6 +130,13 @@ verify: nebulahub.pkg
 	$(PKGTOOL) sfo_listentries "$(STAGE)/sce_sys/param.sfo" > "$(BUILD)/staged-sfo.txt"
 	$(PKGTOOL) sfo_listentries "$(BUILD)/extracted/param.sfo" > "$(BUILD)/packed-sfo.txt"
 	sed '/^PUBTOOLINFO : /d; /^PUBTOOLVER : /d' "$(BUILD)/packed-sfo.txt" | diff - "$(BUILD)/staged-sfo.txt"
+
+test: verify
+	convert -size 32x16 xc:purple "$(BUILD)/runtime-test.jpg"
+	g++ -std=c++17 -O2 -Wall -Wextra -Isrc -I.deps -idirafter "$(SDK)/include" \
+	  tests/runtime.cpp src/db/database.cpp src/ui/image.cpp -pthread -l:libSDL2-2.0.so.0 -o "$(BUILD)/runtime-tests"
+	"$(BUILD)/runtime-tests" "$(BUILD)"
+	python3 -m unittest discover -s tests
 
 clean:
 	rm -rf "$(BUILD)" nebulahub.pkg

@@ -18,14 +18,14 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            clang-18 lld-18 binutils make curl ca-certificates imagemagick fonts-dejavu-core dotnet-sdk-8.0
+            clang-18 lld-18 binutils make g++ libsdl2-2.0-0 python3 curl ca-certificates imagemagick fonts-dejavu-core dotnet-sdk-8.0
       - name: Download and verify OpenOrbis and SDL_ttf
         run: bash scripts/bootstrap-sdk.sh
       - name: Build ELF, FSELF and PKG
         run: make -j"$(nproc)"
-      - name: Validate and extract PKG
+      - name: Validate, extract and test PKG
         run: |
-          make verify
+          make test
           sha256sum nebulahub.pkg > SHA256SUMS
       - uses: actions/upload-artifact@v4
         with:

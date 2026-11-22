@@ -21,6 +21,8 @@ struct ScreenCtx {
     Controller& ctrl;
     Installer&  installer;
     std::function<void(ScreenID, void*)> navigate;
+    bool remoteCatalog;
+    std::string catalogConfigError;
 };
 
 class Screen {
@@ -37,7 +39,7 @@ public:
 class ScreenManager {
 public:
     ScreenManager(Renderer& gfx, Database& db, Fetcher& net,
-                  Controller& ctrl, Installer& installer);
+                  Controller& ctrl, Installer& installer, bool remoteCatalog, std::string catalogConfigError);
 
     void push(ScreenID id, void* param = nullptr);
     void pop();
@@ -83,6 +85,8 @@ private:
     float scrollY_  = 0.f;
     std::string selCategory_;
     std::vector<ContentEntry*> entries_;
+    std::vector<std::string> categories_;
+    bool loaded_ = false;
 
     void refreshEntries(ScreenCtx& ctx);
     void drawCard(ScreenCtx& ctx, ContentEntry* e, int x, int y, bool focused);
@@ -112,7 +116,7 @@ public:
     void render(ScreenCtx& ctx) override;
 private:
     ContentEntry*  entry_;
-    int            btnIdx_    = 0;  // 0=download/install  1=favorite  2=back
+    int            btnIdx_    = 0;  // 0=download, 1=install, 2=favorite
     std::string    statusMsg_;
     bool           downloading_ = false;
 };
@@ -132,6 +136,7 @@ public:
 private:
     int   selIdx_ = 0;
     std::vector<ContentEntry*> favs_;
+    uint64_t revision_ = UINT64_MAX;
 };
 
 class SettingsScreen : public Screen {

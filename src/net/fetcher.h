@@ -1,5 +1,6 @@
 #pragma once
 #include "../nebula.h"
+#include "../db/database.h"
 #include <string>
 #include <cstdint>
 #include <cstdio>
@@ -23,6 +24,7 @@ struct DownloadJob {
     std::string  url;
     std::string  destPath;
     uint64_t     totalBytes   = 0;
+    uint64_t     catalogBytes = 0;
     uint64_t     bytesDown    = 0;
     float        speedBps     = 0.f;
     InstallState state        = InstallState::Queued;
@@ -64,7 +66,8 @@ public:
     ~Fetcher();
 
     void fetchManifestAsync(const std::string& url);
-    std::string takeManifest();
+    std::unique_ptr<Database> takeManifest();
+    std::string manifestStatus() const;
     std::shared_ptr<SDL_Surface> thumbnail(const std::string& url, const std::string& cacheKey);
 
     // Download queue
@@ -84,10 +87,10 @@ private:
     std::unordered_map<std::string, std::shared_ptr<SDL_Surface>> thumbnails_;
     std::deque<std::string> thumbnailOrder_;
     uint64_t generation_ = 0;
-    bool downloadsWritable_ = false;
     bool cacheWritable_ = false;
     std::string networkError_;
-    std::string  manifestCache_;
+    std::unique_ptr<Database> manifestCache_;
+    std::string manifestStatus_;
 
     std::vector<DownloadJob> queue_;
     mutable std::mutex       qMu_;
@@ -96,8 +99,9 @@ private:
 
     void workerLoop();
     bool publishProgress(const DownloadJob& active);
-    bool httpGet(const std::string& url, std::string& body, size_t limit);
-    bool httpDownload(DownloadJob& job);
+    bool httpGet(const std::string& url, std::string& body, size_t limit, const char* item,
+                 std::string& error);
+    bool httpDownload(DownloadJob& job, std::string& partial);
 
     // PS4 native HTTP helpers
     bool netInitialized_ = false;

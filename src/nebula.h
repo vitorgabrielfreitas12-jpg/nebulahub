@@ -5,16 +5,16 @@
 // ─────────────────────────────────────────────
 
 #define APP_TITLE        "NEBULA HUB"
-#define APP_VERSION      "1.0.0"
+#define APP_VERSION      "1.0.1"
 #define TITLE_ID         "NEBU00001"
 
 #define SCREEN_W         1920
 #define SCREEN_H         1080
 
-// Remote manifest — hosted on GitHub Pages (update this URL after deploy)
+// Optional build default. A local manifest-url.txt can override it.
 #define MANIFEST_URL     ""
 
-// Local paths (all writable on GoldHEN)
+// Local paths. Actual write access is checked before using them.
 #define DATA_DIR         "/data/NEBULAHUB/"
 #define DOWNLOAD_DIR     "/data/NEBULAHUB/downloads/"
 #define CACHE_DIR        "/data/NEBULAHUB/cache/"

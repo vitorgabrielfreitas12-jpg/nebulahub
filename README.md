@@ -8,17 +8,20 @@ Avatar packs · static and dynamic themes · DualShock 4 navigation
 ## What it is
 
 NEBULA HUB is a native PS4 homebrew application (`.pkg`) you install on a jailbroken PS4.
-It ships with a catalog of 25 entries. Browse and search avatar packs and themes,
+It ships with an offline catalog of 876 entries. Browse and search avatar packs and themes,
 download files, and submit installation requests from the preview screen.
 
 ---
 
 ## Content sources
 
-| Source | Content | Count |
-|---|---|---|
-| `archive.org/ps4-jb-avatars` | Avatar FPKG packs | 1,100+ individual avatars |
-| `archive.org/ps4-permanent-themes-repository` | Official PSN theme PKGs | 1,500+ themes |
+| Source | Entries in the packaged catalog |
+|---|---|
+| `archive.org/ps4-jb-avatars` | Four avatar-pack records, three indexed downloads |
+| `archive.org/ps4-permanent-themes-repository` | 872 theme records, 854 indexed pairs |
+
+File names and sizes come from the public archive indexes. An indexed file may
+still fail to download due to availability, network policy or console TLS.
 
 ---
 
@@ -73,39 +76,52 @@ Use x86-64 Ubuntu 24.04 with Clang and LLD 18. GitHub Actions runs the same comm
 ```bash
 sudo apt-get update
 sudo apt-get install --no-install-recommends \
-  clang-18 lld-18 binutils make curl imagemagick fonts-dejavu-core dotnet-sdk-8.0
+  clang-18 lld-18 binutils make g++ libsdl2-2.0-0 python3 curl \
+  imagemagick fonts-dejavu-core dotnet-sdk-8.0
 bash scripts/bootstrap-sdk.sh
 make -j"$(nproc)"
-make verify
+make test
 ```
 
 The bootstrap checks the SHA-256 of the OpenOrbis 0.5.4 release, SDL_ttf 2.0.15
 source and header, nlohmann/json 3.11.3, and a pinned LibOrbisPkg revision.
-The SDK supplies the target libc++, SDL2, SDL_image, startup object and ELF
+The SDK supplies the target libc++, SDL2, stb_image, startup object and ELF
 conversion tools. The bootstrap builds PkgTool.Core with .NET 8 for OpenSSL 3. SDL_ttf links against the SDK's
 FreeType exports. The build creates `build/eboot.elf`, `build/eboot.oelf`,
 `build/pkg/eboot.bin` and `nebulahub.pkg`. Verification reads the ELF and OELF,
 checks the PKG and compares its extracted payload with the staged files.
 
-## Catalog URL
+## Catalog updates
 
-The packaged manifest is available on first launch without a catalog server.
-Set `MANIFEST_URL` in `src/nebula.h` to your HTTPS manifest URL to enable refreshes.
-The catalog keeps entries with unavailable downloads so their IDs and favorites
-remain stable. Download URLs and sizes in the bundled catalog were checked
-against the archive indexes.
+To update the catalog without rebuilding the app, place a one-line HTTPS URL
+in `/data/NEBULAHUB/manifest-url.txt` and restart the app. Use a direct URL to a
+JSON document you are authorized to publish, for example a file on your own
+GitHub Pages site. No endpoint is configured by default. The Settings screen
+shows the last update result without displaying the configured URL.
 
-To generate a separate manifest from the archive listing:
+The app starts from the bundled manifest or the last valid remote cache.
+It validates the new manifest in the background, then applies it when the
+Home screen is active. Favorites are keyed by stable IDs, including favorites
+whose records are temporarily absent. The download cap is 16 MiB, and the
+manifest cap is 10,000 entries. An empty, malformed or duplicate-ID update
+leaves the previous catalog in place.
+
+Generate a new manifest separately before publishing it:
 
 ```bash
 python3 scripts/gen_manifest.py --output /tmp/nebula-manifest.json
 ```
 
+The generator pairs exact `_1.pkg` and `_2.pkg` names, retains IDs from the seed,
+and uses archive sizes and exact name matches for previews. Unclassified
+standalone PKGs require independent validation before being added as
+`pkg_theme` entries. Use `--offline` to export just the reviewed seed.
+
 ## USING THE APP
 
 | Button | Action |
 |---|---|
-| D-Pad | Navigate |
+| D-Pad / left stick | Navigate |
 | ✕ | Select / confirm |
 | ○ | Back |
 | △ | Favorite / unfavorite |
@@ -122,9 +138,10 @@ python3 scripts/gen_manifest.py --output /tmp/nebula-manifest.json
 **To install a theme:**
 1. Themes → pick category → select item → ✕
 2. Preview screen → DOWNLOAD → ✕
-3. Both PKG parts download automatically
-4. Select INSTALL after both downloads to validate the pair and submit the installation request.
-5. Go to **Settings → Themes → My Themes** to apply
+3. Wait for both downloads when the theme has two components.
+4. Select INSTALL to validate the files and submit part 1 or the standalone package.
+5. For a pair, wait until the PS4 confirms part 1, then select INSTALL again to submit part 2 in the same app session.
+6. Check **Settings → Themes → My Themes** after the console finishes.
 
 ---
 
@@ -136,8 +153,15 @@ across restart. For theme pairs and avatar packs, verify that the console
 accepts the installation request and that the content appears after installation.
 
 
-The six bundled previews are resized copies of the icon entries in the catalog's
-source packages. Other entries can supply a JPEG or PNG preview URL.
+The six packaged PNGs are original category illustrations. Three catalog
+entries link to matching JPEGs in the archive. Other entries show a fallback.
+Decoding and HTTP run outside the render loop.
+
+Transfers use verified EOF and a temporary file before publishing. The app
+reads Content-Length from the actual GET when supplied. Pause, cancellation
+or an interrupted connection leaves no completed download. Resume starts a
+fresh transfer because partial HTTP responses are not combined without
+validator and range support.
 
 If an operation fails on the console, copy `/data/NEBULAHUB/diagnostics.log`
 and record the exact system error and whether it happened during Download or

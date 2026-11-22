@@ -26,20 +26,20 @@ bool Installer::submit(ContentEntry entry) {
             const auto done = [this, &entry](bool ok, const std::string& message) {
                 std::lock_guard<std::mutex> lock(mutex_);
                 resultId_ = entry.id;
-                result_ = ok ? "Submitted. Check system notifications." : message;
+                result_ = ok && message.empty() ? "Pedido enviado. Confira as notificações do PS4." : message;
             };
             try {
-                diagnostic(("Install requested " + entry.id).c_str(), 0);
+                diagnostic("installer", "Install requested", ErrorDomain::Event, 0, entry.id.c_str());
                 if (entry.type == ContentType::Avatar) installAvatar(entry, done);
                 else installTheme(entry, done);
             } catch (const std::exception&) {
-                done(false, diagnostic("Installation worker failed", EIO));
+                done(false, diagnostic("installer", "Installation worker failed", ErrorDomain::Application, EIO));
             }
             busy_ = false;
         });
     } catch (const std::system_error& error) {
         busy_ = false;
-        diagnostic("Start installation worker", error.code().value());
+        diagnostic("installer", "Start worker", ErrorDomain::Posix, error.code().value());
         return false;
     }
     return true;
@@ -63,7 +63,7 @@ bool Installer::copyFile(const std::string& src, const std::string& dst) {
     size_t n;
     bool ok = true;
     while ((n = fread(buf, 1, sizeof(buf), fin)) > 0) {
-        if (fwrite(buf, 1, n, fout) != n) { ok = false; break; }
+        if (const auto failure = writeStorage(fout, buf, n)) { errno = failure.code; ok = false; break; }
     }
     ok = ok && !ferror(fin);
     fclose(fin);
@@ -77,6 +77,28 @@ bool Installer::copyFile(const std::string& src, const std::string& dst) {
 //  Avatar install
 // ─────────────────────────────────────────────
 
+namespace {
+std::string packageError(const std::string& path, uint64_t expected, PackageInfo& info) {
+    int code = 0;
+    const auto status = inspectPackage(path, expected, &info, &code);
+    if (status == PackageStatus::Valid) return {};
+    const auto domain = code ? ErrorDomain::Posix : ErrorDomain::Application;
+    diagnostic("installer", "Validate local package", domain,
+               code ? code : static_cast<int>(status), path.c_str());
+    switch (status) {
+        case PackageStatus::Missing: return "Baixe o pacote antes de instalar.";
+        case PackageStatus::Incomplete: return "Download incompleto. Não é possível instalar.";
+        case PackageStatus::Invalid: return "Arquivo PKG inválido ou incompatível.";
+        default: return code ? "Falha ao ler o PKG: " + std::string(strerror(code)) : "Falha ao ler o PKG.";
+    }
+}
+
+std::string unsupportedType(const std::string& path) {
+    diagnostic("installer", "Unsupported package type", ErrorDomain::Application, 0, path.c_str());
+    return "Tipo de PKG incompatível.";
+}
+}
+
 bool Installer::installAvatar(const ContentEntry& entry,
                                std::function<void(bool,std::string)> cb) {
     if (entry.localPath.empty()) {
@@ -88,12 +110,12 @@ bool Installer::installAvatar(const ContentEntry& entry,
         // This is a BULK FPKG (F1nnish pack) — we install it as a PKG
         // then the user applies individual avatars from Avatar Changer
         PackageInfo package;
-        if (!entry.fileSize || !isCompletePackage(entry.localPath, entry.fileSize, &package) ||
-            package.type != 0x1a) {
-            cb(false, diagnostic("Avatar PKG rejected: size, format or type", EINVAL));
+        auto error = packageError(entry.localPath, entry.fileSize, package);
+        if (error.empty() && package.type != 0x1a) error = unsupportedType(entry.localPath);
+        if (!error.empty()) {
+            cb(false, error);
             return false;
         }
-        std::string error;
         bool ok = launchPkgInstall(entry.localPath, error);
         if (ok) {
             notify("NEBULA HUB",
@@ -112,7 +134,7 @@ bool Installer::installAvatar(const ContentEntry& entry,
     if (entry.fileFormat != "xavatar" || !entry.fileSize ||
         stat(entry.localPath.c_str(), &info) != 0 || !S_ISREG(info.st_mode) ||
         static_cast<uint64_t>(info.st_size) != entry.fileSize) {
-        cb(false, diagnostic("Unsupported or incomplete avatar file", EINVAL));
+        cb(false, diagnostic("installer", "Unsupported or incomplete avatar file", ErrorDomain::Application, 0, entry.localPath.c_str()));
         return false;
     }
     bool ok = writableDirectory(AVATAR_DEST) && copyFile(entry.localPath, dst);
@@ -121,7 +143,7 @@ bool Installer::installAvatar(const ContentEntry& entry,
                std::string("Avatar ready! Open Avatar Changer to apply ") + entry.name);
         cb(true, dst);
     } else {
-        cb(false, diagnostic("Copy avatar", errno));
+        cb(false, diagnostic("installer", "Copy avatar", ErrorDomain::Posix, errno, dst.c_str()));
     }
     return ok;
 }
@@ -132,49 +154,57 @@ bool Installer::installAvatar(const ContentEntry& entry,
 
 bool Installer::installTheme(const ContentEntry& entry,
                               std::function<void(bool,std::string)> cb) {
-    // Themes come as _1 (stub) + _2 (payload) pair
-    // Both must be in /data/pkg/ before triggering install
-    if (entry.localStubPath.empty() || entry.localPayloadPath.empty()) {
-        cb(false, "Files not downloaded");
+    if (entry.fileFormat == "pkg_theme") {
+        PackageInfo info;
+        auto error = packageError(entry.localPath, entry.fileSize, info);
+        if (error.empty() && !isThemePayload(info))
+            error = unsupportedType(entry.localPath);
+        const bool accepted = error.empty() && launchPkgInstall(entry.localPath, error);
+        cb(accepted, error);
+        return accepted;
+    }
+    if (entry.fileFormat != "pkg_split") {
+        cb(false, "Formato de tema incompatível.");
         return false;
     }
 
     PackageInfo first, second;
-    if (entry.fileFormat != "pkg_split" || !entry.stubSize || !entry.payloadSize ||
-        !isCompletePackage(entry.localStubPath, entry.stubSize, &first) ||
-        !isCompletePackage(entry.localPayloadPath, entry.payloadSize, &second) ||
-        first.contentId != second.contentId ||
-        !(first.type == 0x1c || (first.type == 0x1b && first.iroTag == 2)) ||
-        second.type != 0x1b || second.iroTag != 2) {
-        cb(false, diagnostic("Theme PKG pair rejected: size, format or type", EINVAL));
+    auto error = packageError(entry.localStubPath, entry.stubSize, first);
+    if (!error.empty()) {
+        cb(false, "Parte 1: " + error);
         return false;
     }
-    if (!writableDirectory(PKG_INSTALL_DIR)) {
-        cb(false, "System package directory is not writable");
+    error = packageError(entry.localPayloadPath, entry.payloadSize, second);
+    if (!error.empty()) {
+        cb(false, "Parte 2: " + error);
         return false;
     }
-    // Copy to pkg dir with correct names
-    std::string stub    = std::string(PKG_INSTALL_DIR) + entry.id + "_1.pkg";
-    std::string payload = std::string(PKG_INSTALL_DIR) + entry.id + "_2.pkg";
-
-    if (!copyFile(entry.localStubPath, stub) ||
-        !copyFile(entry.localPayloadPath, payload) ||
-        !isCompletePackage(stub, entry.stubSize) || !isCompletePackage(payload, entry.payloadSize)) {
-        cb(false, diagnostic("Stage theme pair", errno));
+    if (!isThemePair(first, second)) {
+        cb(false, unsupportedType(entry.localStubPath));
         return false;
     }
-
-    // Submit the stub after both parts are staged.
-    std::string error;
-    bool ok = launchPkgInstall(stub, error);
-    if (ok) {
-        notify("NEBULA HUB",
-               std::string("Installing: ") + entry.name + "\nGo to Settings → Themes");
-        cb(true, "");
-    } else {
+    if (!writableDirectory(PKG_INSTALL_DIR, &error)) {
         cb(false, error);
+        return false;
     }
-    return ok;
+
+    const auto pairKey = entry.id + ":" + first.contentId;
+    const bool secondPart = pendingTheme_ == pairKey;
+    const auto& source = secondPart ? entry.localPayloadPath : entry.localStubPath;
+    const auto staged = std::string(PKG_INSTALL_DIR) + entry.id + (secondPart ? "_2.pkg" : "_1.pkg");
+    if (!copyFile(source, staged)) {
+        cb(false, diagnostic("installer", "Stage theme component", ErrorDomain::Posix, errno, staged.c_str()));
+        return false;
+    }
+    error = packageError(staged, secondPart ? entry.payloadSize : entry.stubSize, secondPart ? second : first);
+    if (!error.empty() || !launchPkgInstall(staged, error)) {
+        cb(false, std::string(secondPart ? "Parte 2: " : "Parte 1: ") + error);
+        return false;
+    }
+    pendingTheme_ = secondPart ? "" : pairKey;
+    cb(true, secondPart ? "Parte 2 enviada. Confira as notificações do PS4."
+                        : "Parte 1 enviada. Aguarde a instalação no PS4 antes de selecionar Install novamente.");
+    return true;
 }
 
 // ─────────────────────────────────────────────
@@ -184,19 +214,20 @@ bool Installer::installTheme(const ContentEntry& entry,
 bool Installer::launchPkgInstall(const std::string& pkgPath, std::string& error) {
     int rc = sceSysmoduleLoadModuleInternal(ORBIS_SYSMODULE_INTERNAL_APP_INST_UTIL);
     if (rc < 0) {
-        error = diagnostic("Load AppInstUtil module", rc);
+        error = diagnostic("installer", "Load AppInstUtil module", ErrorDomain::Orbis, rc);
         return false;
     }
     rc = sceAppInstUtilInitialize();
     if (rc < 0) {
-        error = diagnostic("Initialize AppInstUtil", rc);
+        error = diagnostic("installer", "Initialize AppInstUtil", ErrorDomain::Orbis, rc);
         return false;
     }
-    diagnostic("Calling AppInstUtil to submit PKG", 0);
+    diagnostic("installer", "Submit PKG", ErrorDomain::Event, 0, pkgPath.c_str());
     rc = sceAppInstUtilAppInstallPkg(pkgPath.c_str(), nullptr);
-    diagnostic("AppInstUtil submit PKG", rc);
+    const auto result = diagnostic("installer", rc < 0 ? "AppInstUtil rejected PKG" : "AppInstUtil accepted request",
+                                   ErrorDomain::Orbis, rc, pkgPath.c_str());
     sceAppInstUtilTerminate();
-    if (rc < 0) error = diagnostic("AppInstUtil rejected PKG", rc);
+    if (rc < 0) error = result;
     return rc >= 0;
 }
 
