@@ -34,6 +34,7 @@ jobs:
           echo "Verificando arquivos do OpenOrbis:"
           echo "Verificando pastas de ferramentas:"
           ls -la openorbis/PS4Toolchain/bin
+          ls -lah openorbis/PS4Toolchain/bin/linux/
           find openorbis/PS4Toolchain -type f \( -name '*clang*' -o -name '*lld*' -o -name '*orbis*' \) -print
           find openorbis -type f \( -name "clang++" -o -name "clang" \) -print
           echo "OO_PS4_TOOLCHAIN=$(pwd)/openorbis" >> $GITHUB_ENV
