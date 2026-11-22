@@ -133,7 +133,7 @@ standalone PKGs require independent validation before being added as
 1. Avatars → pick category → select item → ✕
 2. Preview screen → DOWNLOAD → ✕
 3. Wait for download (see Downloads screen)
-4. Select INSTALL to validate the local file and submit the copy or installation request. Apply individual avatars through **Avatar Changer (LAPY)**.
+4. Select INSTALL to validate the local file and submit the installation request. For example, the Anime pack is a PS4 application PKG with category `gd` and title ID `LAPY90015`. Apply individual avatars through **Avatar Changer (LAPY)**. An individual `.xavatar` entry uses the separate copy flow.
 
 **To install a theme:**
 1. Themes → pick category → select item → ✕
@@ -166,3 +166,27 @@ validator and range support.
 If an operation fails on the console, copy `/data/NEBULAHUB/diagnostics.log`
 and record the exact system error and whether it happened during Download or
 Install. Installation requests are submitted separately after local validation.
+
+
+### Download diagnostics
+
+`Queued` means the transfer is waiting behind another file. `Validating` follows
+the transfer and precedes publication of the final file. `Completed` means the
+file passed the app's structural and role checks. The PS4 installation service
+still decides if the submitted package can be installed. Removing finished
+history keeps the final file. Cancelled or interrupted transfers leave only
+temporary files, which the app cleans up on cancellation or next launch.
+
+In Settings, **Keep failed download for diagnostics** opts in for the current
+session. The app can retain one fully transferred sample rejected by package
+validation, up to 192 MiB, as `/data/NEBULAHUB/diagnostic-rejected.bin`. A new
+sample replaces the previous one. **Delete rejected sample** shows the stored
+size and requests deletion. The install flow only reads the normal download
+paths. Logs omit the source URL path and query to protect credentials.
+
+For a short console test, the first part of **Azure Earth Orbital Remastered -
+Dynamic** is 1 MiB. It should reach Completed before the second part starts.
+Only submit installation after both parts pass. For remote preview testing use
+**TEKKEN 7**, **PAC-MAN Championship Edition 2** or **TERA - Anniversary**.
+Other entries may show an illustration while loading, when no individual preview
+is listed, or after a preview failure.

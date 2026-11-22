@@ -7,6 +7,40 @@
 #include <sys/stat.h>
 #include "../net/url.h"
 
+namespace {
+void drawPreview(ScreenCtx& ctx, const ContentEntry& entry, int x, int y, int w, int h) {
+    const auto preview = ctx.net.thumbnail(entry.previewUrl, entry.id);
+    auto& gfx = ctx.gfx;
+    auto* texture = gfx.loadTexture(entry.id + entry.previewUrl, preview.image.get());
+    const char* caption = nullptr;
+    if (texture) {
+        gfx.drawTexture(texture, x, y, w, h);
+        if (preview.state == PreviewState::Illustration) caption = "Ilustração de categoria";
+    } else {
+        const bool avatar = entry.type == ContentType::Avatar;
+        const auto accent = fromHex(avatar ? 0xBCA1EBFF : 0xA9C8EFFF);
+        gfx.fillRoundRect(x, y, w, h, 10, fromHex(avatar ? 0x281849FF : 0x172A4BFF));
+        const int icon = std::min(w, h) / 3;
+        const int cx = x + w / 2;
+        const int cy = y + h / 2 - 6;
+        if (avatar) {
+            gfx.fillRoundRect(cx - icon / 5, cy - icon / 2, icon * 2 / 5, icon * 2 / 5, icon / 5, accent);
+            gfx.fillRoundRect(cx - icon / 2, cy, icon, icon / 3, icon / 6, accent);
+        } else {
+            gfx.drawRect(cx - icon / 2, cy - icon / 2, icon, icon * 3 / 4, accent, 2);
+            gfx.drawLine(cx - icon / 2, cy + icon / 8, cx - icon / 6, cy - icon / 6, accent);
+            gfx.drawLine(cx - icon / 6, cy - icon / 6, cx + icon / 5, cy + icon / 8, accent);
+        }
+        caption = preview.state == PreviewState::Missing ? "Sem prévia cadastrada" :
+                  preview.state == PreviewState::Loading ? "Carregando prévia" : "Falha na prévia";
+    }
+    if (caption) {
+        gfx.fillRect(x, y + h - 32, w, 32, fromHex(0x11101CDD));
+        gfx.textCentered(caption, x, y + h - 32, w, 32, fromHex(COL_TEXT), 16);
+    }
+}
+}
+
 // ─────────────────────────────────────────────
 //  ScreenManager
 // ─────────────────────────────────────────────
@@ -187,16 +221,7 @@ void LibraryScreen::drawCard(ScreenCtx& ctx, ContentEntry* e, int x, int y, bool
     Color bg = focused ? fromHex(0x1E1E30FF) : fromHex(COL_PANEL);
     gfx.fillRoundRect(x, y, cw, ch, 12, bg);
 
-    // Thumbnail area
-    const auto image = ctx.net.thumbnail(e->previewUrl, e->id);
-    SDL_Texture* thumb = gfx.loadTexture(e->id + e->previewUrl, image.get());
-
-    if (thumb) {
-        gfx.drawTexture(thumb, x+8, y+8, cw-16, 200);
-    } else {
-        gfx.fillRoundRect(x+8, y+8, cw-16, 200, 8, fromHex(0x241838FF));
-        gfx.textCentered("No preview", x+8, y+8, cw-16, 200, fromHex(COL_SUBTEXT), 18);
-    }
+    drawPreview(ctx, *e, x + 8, y + 8, cw - 16, 200);
 
     // Name
     std::string nm = gfx.truncate(e->name, cw-16, 18, false);
@@ -517,13 +542,13 @@ void PreviewScreen::update(ScreenCtx& ctx) {
     for (const auto& job : jobs) {
         if (job.id != entry_->id && job.id != entry_->id + "_stub" &&
             job.id != entry_->id + "_payload") continue;
-        pending |= job.state == InstallState::Queued || job.state == InstallState::Downloading;
-        if (job.state == InstallState::Error) error = job.errorMsg;
+        pending |= job.state == DownloadState::Queued || activeDownload(job.state);
+        if (job.state == DownloadState::Failed) error = job.errorMsg;
     }
     if (downloading_ && !pending) {
         bool completed = std::any_of(jobs.begin(), jobs.end(), [&](const auto& job) {
             return (job.id == entry_->id || job.id == entry_->id + "_payload") &&
-                   job.state == InstallState::Done;
+                   job.state == DownloadState::Completed;
         });
         statusMsg_ = !error.empty() ? error : completed ? "Transfer finished. Select Install to verify the files."
                                                       : "Transfer cancelled.";
@@ -565,19 +590,22 @@ void PreviewScreen::update(ScreenCtx& ctx) {
     }
 
     const auto enqueue = [&](const std::string& id, const std::string& url,
-                             const std::string& path, uint64_t bytes) {
+                             const std::string& path, uint64_t bytes, PackageRole role) {
         DownloadJob job;
         job.id = id;
         job.url = url;
         job.destPath = path;
         job.totalBytes = bytes;
+        job.role = role;
         ctx.net.enqueue(std::move(job));
     };
     if (!splitTheme(*entry_)) {
-        enqueue(entry_->id, entry_->downloadUrl, singlePath, entry_->fileSize);
+        enqueue(entry_->id, entry_->downloadUrl, singlePath, entry_->fileSize,
+                !avatar ? PackageRole::ThemePayload : entry_->fileFormat == "xavatar_fpkg" ?
+                PackageRole::AvatarPack : PackageRole::None);
     } else {
-        enqueue(entry_->id + "_stub", entry_->pkgStubUrl, stubPath, entry_->stubSize);
-        enqueue(entry_->id + "_payload", entry_->pkgPayloadUrl, payloadPath, entry_->payloadSize);
+        enqueue(entry_->id + "_stub", entry_->pkgStubUrl, stubPath, entry_->stubSize, PackageRole::ThemeFirst);
+        enqueue(entry_->id + "_payload", entry_->pkgPayloadUrl, payloadPath, entry_->payloadSize, PackageRole::ThemePayload);
     }
     statusMsg_ = "Queued for download";
     downloading_ = true;
@@ -595,15 +623,7 @@ void PreviewScreen::render(ScreenCtx& ctx) {
     gfx.fillRoundRect(artX - 8, artY - 8, artW + 16, artH + 16, 16,
                       fromHex(0x1A1A2EFF));
 
-    const auto image = ctx.net.thumbnail(entry_->previewUrl, entry_->id);
-    SDL_Texture* t = gfx.loadTexture(entry_->id + entry_->previewUrl, image.get());
-    if (t) {
-        gfx.drawTexture(t, artX, artY, artW, artH);
-    } else {
-        gfx.fillRoundRect(artX, artY, artW, artH, 12, fromHex(0x1A1A30FF));
-        gfx.textCentered("Preview unavailable or loading", artX, artY, artW, artH,
-                         fromHex(COL_SUBTEXT), 24);
-    }
+    drawPreview(ctx, *entry_, artX, artY, artW, artH);
 
     // Right — info panel
     int infoX = artX + artW + 80;
@@ -694,7 +714,7 @@ void PreviewScreen::render(ScreenCtx& ctx) {
         if (j.id == entry_->id || j.id == entry_->id + "_stub" ||
             j.id == entry_->id + "_payload") {
             int py = by + bh + 30;
-            gfx.text(transferSize(j) + (j.state == InstallState::Downloading ? "  " + j.speedStr() + "  ETA: " + j.etaStr() : ""),
+            gfx.text(transferSize(j) + (j.state == DownloadState::Downloading ? "  " + j.speedStr() + "  ETA: " + j.etaStr() : ""),
                      infoX, py, fromHex(COL_SUBTEXT), 18);
             if (j.totalBytes) gfx.progressBar(infoX, py + 30, infoW, 12, j.progress(),
                             fromHex(0x222233FF), fromHex(COL_PROGRESS), 6);
@@ -719,7 +739,8 @@ void DownloadsScreen::update(ScreenCtx& ctx) {
             else          ctx.net.pause(j.id);
         }
         if (ctx.ctrl.pressed(ORBIS_PAD_BUTTON_TRIANGLE)) ctx.net.cancel(j.id);
-        if (ctx.ctrl.pressed(ORBIS_PAD_BUTTON_CROSS) && j.state == InstallState::Error)
+        if (ctx.ctrl.pressed(ORBIS_PAD_BUTTON_CROSS) &&
+            (j.state == DownloadState::Failed || j.state == DownloadState::Cancelled))
             ctx.net.retry(j.id);
     }
 }
@@ -748,19 +769,19 @@ void DownloadsScreen::render(ScreenCtx& ctx) {
         gfx.text(j.id, 90, ry + 10, fromHex(COL_TEXT), 20, true);
 
         // Status + speed
-        static const char* stateStr[] = {"None","Queued","Downloading","Installing","Done","Error"};
+        static const char* stateStr[] = {"Queued","Connecting","Downloading","Validating","Completed","Failed","Cancelled"};
         Color stc = fromHex(COL_SUBTEXT);
-        if (j.state == InstallState::Downloading) stc = fromHex(COL_PROGRESS);
-        if (j.state == InstallState::Done)        stc = fromHex(COL_SUCCESS);
-        if (j.state == InstallState::Error)       stc = fromHex(COL_ERROR);
+        if (activeDownload(j.state)) stc = fromHex(COL_PROGRESS);
+        if (j.state == DownloadState::Completed)        stc = fromHex(COL_SUCCESS);
+        if (j.state == DownloadState::Failed)       stc = fromHex(COL_ERROR);
 
         std::string info = j.paused ? "Pausado" : stateStr[static_cast<int>(j.state)];
-        if (j.state == InstallState::Downloading)
+        if (j.state == DownloadState::Downloading)
             info += "  " + j.speedStr() + "  ETA: " + j.etaStr();
-        if (j.state == InstallState::Error) info += "  " + j.errorMsg;
+        if (j.state == DownloadState::Failed) info += "  " + j.errorMsg;
         gfx.text(gfx.truncate(info, SCREEN_W - 180, 18), 90, ry + 37, stc, 18);
-        gfx.text(transferSize(j), 90, ry + 60, fromHex(COL_TEXT), 18);
-        if (j.totalBytes) gfx.progressBar(90, ry + 86, SCREEN_W - 200, 10, j.progress(),
+        gfx.text(j.state == DownloadState::Queued ? "Aguardando a vez na fila" : transferSize(j), 90, ry + 60, fromHex(COL_TEXT), 18);
+        if (j.totalBytes && j.state != DownloadState::Queued) gfx.progressBar(90, ry + 86, SCREEN_W - 200, 10, j.progress(),
                                          fromHex(0x222233FF), fromHex(COL_PROGRESS), 5);
 
         ry += 126;
@@ -769,7 +790,7 @@ void DownloadsScreen::render(ScreenCtx& ctx) {
 
     int hy = SCREEN_H - 56;
     gfx.fillRect(0, hy, SCREEN_W, 56, fromHex(0x0A0A14E0), 0.9f);
-    gfx.text("□  Pause/Resume    △  Cancel    ✕  Retry error    ○  Back",
+    gfx.text("□  Pause/Resume    △  Cancel / Remove history    ✕  Retry    ○  Back",
              60, hy + 16, fromHex(COL_SUBTEXT), 20);
 }
 
@@ -826,12 +847,23 @@ void SettingsScreen::update(ScreenCtx& ctx) {
             {"Download Dir",    DOWNLOAD_DIR},
             {"Cache Dir",       CACHE_DIR},
             {"App Version",     APP_VERSION},
+            {"Keep failed download for diagnostics", ""},
+            {"Delete rejected sample", ""},
         };
     }
     settings_[1].value = ctx.catalogConfigError.empty() ? ctx.net.manifestStatus() : ctx.catalogConfigError;
     if (settings_[1].value.empty()) settings_[1].value = "Nenhuma atualização remota configurada";
     if (ctx.ctrl.pressed(ORBIS_PAD_BUTTON_DOWN) && selIdx_ < (int)settings_.size()-1) selIdx_++;
     if (ctx.ctrl.pressed(ORBIS_PAD_BUTTON_UP)   && selIdx_ > 0) selIdx_--;
+    constexpr int keep = 5, clear = 6;
+    if (ctx.ctrl.pressed(ORBIS_PAD_BUTTON_CROSS)) {
+        if (selIdx_ == keep) ctx.net.toggleKeepRejected();
+        if (selIdx_ == clear) ctx.net.requestClearRejected();
+    }
+    settings_[keep].value = ctx.net.keepingRejected() ? "Ativado nesta sessão · ✕ para desligar" :
+                                                        "Desativado · ✕ para manter uma amostra nesta sessão";
+    settings_[clear].value = formatBytes(ctx.net.rejectedBytes()) +
+                            " / 192 MiB · " REJECTED_DOWNLOAD " · ✕ para excluir";
 }
 
 void SettingsScreen::render(ScreenCtx& ctx) {

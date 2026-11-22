@@ -63,6 +63,7 @@ int main() {
         Renderer gfx(renderer);
         Database db;
         Fetcher net;
+        diagnostic("app", "Start Nebula Hub " APP_VERSION, ErrorDomain::Event);
         Controller ctrl(userId);
         Installer installer;
 
