@@ -79,17 +79,19 @@ bool Installer::copyFile(const std::string& src, const std::string& dst) {
 
 namespace {
 std::string packageError(const std::string& path, uint64_t expected, PackageInfo& info) {
-    int code = 0;
-    const auto status = inspectPackage(path, expected, &info, &code);
-    if (status == PackageStatus::Valid) return {};
-    const auto domain = code ? ErrorDomain::Posix : ErrorDomain::Application;
-    diagnostic("installer", "Validate local package", domain,
-               code ? code : static_cast<int>(status), path.c_str());
-    switch (status) {
+    const auto result = inspectPackageDetails(path, expected);
+    const auto context = path + " " + describePackage(result, expected);
+    diagnostic("installer", result.reason, result.ioError ? ErrorDomain::Posix : ErrorDomain::Event,
+               result.ioError, context.c_str());
+    if (result) {
+        info = result.info;
+        return {};
+    }
+    switch (result.status) {
         case PackageStatus::Missing: return "Baixe o pacote antes de instalar.";
         case PackageStatus::Incomplete: return "Download incompleto. Não é possível instalar.";
         case PackageStatus::Invalid: return "Arquivo PKG inválido ou incompatível.";
-        default: return code ? "Falha ao ler o PKG: " + std::string(strerror(code)) : "Falha ao ler o PKG.";
+        default: return result.ioError ? "Falha ao ler o PKG: " + std::string(strerror(result.ioError)) : "Falha ao ler o PKG.";
     }
 }
 

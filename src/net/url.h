@@ -29,3 +29,10 @@ inline std::string httpsRedirect(const std::string& current, const std::string& 
                      base.substr(0, base.rfind('/') + 1)) + location;
     return validHttpsUrl(absolute) ? absolute : std::string{};
 }
+
+
+// A path on a caller-supplied HTTPS URL may itself carry a credential.
+inline std::string diagnosticOrigin(const std::string& url) {
+    if (!validHttpsUrl(url)) return "invalid-https-origin";
+    return url.substr(0, url.find_first_of("/?#", 8));
+}

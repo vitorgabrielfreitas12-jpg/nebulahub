@@ -1,6 +1,6 @@
 TITLE := NEBULA HUB
 TITLE_ID := NEBU00001
-VERSION := 01.01
+VERSION := 01.02
 CONTENT_ID := IV0000-NEBU00001_00-NEBULAHUB0000001
 OO_PS4_TOOLCHAIN ?= $(CURDIR)/.deps/OpenOrbis/PS4Toolchain
 SDL_TTF_SRC ?= .deps/SDL_ttf.c
@@ -133,6 +133,7 @@ verify: nebulahub.pkg
 
 test: verify
 	convert -size 32x16 xc:purple "$(BUILD)/runtime-test.jpg"
+	convert -size 16x16 xc:none PNG32:"$(BUILD)/runtime-alpha.png"
 	g++ -std=c++17 -O2 -Wall -Wextra -Isrc -I.deps -idirafter "$(SDK)/include" \
 	  tests/runtime.cpp src/db/database.cpp src/ui/image.cpp -pthread -l:libSDL2-2.0.so.0 -o "$(BUILD)/runtime-tests"
 	"$(BUILD)/runtime-tests" "$(BUILD)"

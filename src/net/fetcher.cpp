@@ -48,6 +48,11 @@ Fetcher::Fetcher() {
     writableDirectory(DATA_DIR);
     cacheWritable_ = writableDirectory(CACHE_DIR) && writableDirectory(THUMB_DIR);
     try {
+        previewWorker_ = std::thread([this] { localPreviewLoop(); });
+    } catch (const std::system_error& error) {
+        diagnostic("preview", "Start local preview worker", ErrorDomain::Posix, error.code().value());
+    }
+    try {
         worker_ = std::thread([this] {
             initNet();
             workerLoop();
@@ -60,7 +65,12 @@ Fetcher::Fetcher() {
 }
 
 Fetcher::~Fetcher() {
-    running_ = false;
+    {
+        std::lock_guard<std::mutex> lock(qMu_);
+        running_ = false;
+    }
+    previewReady_.notify_one();
+    if (previewWorker_.joinable()) previewWorker_.join();
     if (worker_.joinable()) worker_.join();
 }
 
@@ -112,6 +122,7 @@ namespace {
 struct HttpRequest {
     int connection = -1;
     int request = -1;
+    int response = 0;
     ~HttpRequest() { reset(); }
 
     void reset() {
@@ -120,7 +131,7 @@ struct HttpRequest {
         request = connection = -1;
     }
 
-    std::string redirectLocation() const {
+    std::string responseHeader(const char* requested) const {
         char* headers = nullptr;
         size_t size = 0;
         if (sceHttpGetAllResponseHeaders(request, &headers, &size) < 0 ||
@@ -132,10 +143,10 @@ struct HttpRequest {
             if (end == std::string_view::npos) lines = {};
             else lines.remove_prefix(end + 1);
             const auto colon = line.find(':');
-            if (colon != 8) continue;
+            if (colon == std::string_view::npos || colon > 64) continue;
             std::string name(line.substr(0, colon));
             for (char& c : name) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-            if (name != "location") continue;
+            if (name != requested) continue;
             line.remove_prefix(colon + 1);
             while (!line.empty() && (line.front() == ' ' || line.front() == '\t')) line.remove_prefix(1);
             while (!line.empty() && (line.back() == ' ' || line.back() == '\r' ||
@@ -151,6 +162,7 @@ struct HttpRequest {
             return false;
         }
         for (int redirect = 0; redirect <= 5; ++redirect) {
+            response = 0;
             connection = sceHttpCreateConnectionWithURL(httpTemplate, url.c_str(), false);
             if (connection < 0) {
                 error = diagnostic("network", "HTTP create connection", ErrorDomain::Orbis, connection, item);
@@ -167,7 +179,6 @@ struct HttpRequest {
                 error = diagnostic("network", "HTTP send / TLS", ErrorDomain::Orbis, status, item);
                 return false;
             }
-            int response = 0;
             status = sceHttpGetStatusCode(request, &response);
             if (status < 0) {
                 error = diagnostic("network", "HTTP read status", ErrorDomain::Orbis, status, item);
@@ -179,7 +190,7 @@ struct HttpRequest {
                 diagnostic("network", "HTTP response", ErrorDomain::Http, response, item);
                 return false;
             }
-            url = httpsRedirect(url, redirectLocation());
+            url = httpsRedirect(url, responseHeader("location"));
             diagnostic("network", "HTTP redirect", ErrorDomain::Http, response, item);
             if (url.empty()) {
                 error = diagnostic("network", "Invalid HTTPS redirect", ErrorDomain::Application, 0, item);
@@ -221,7 +232,8 @@ bool Fetcher::httpGet(const std::string& url, std::string& body, size_t limit,
 }
 
 bool Fetcher::httpDownload(DownloadJob& job, std::string& partial) {
-    const auto context = job.id + " " + job.destPath;
+    const auto context = job.id + " path=" + job.destPath;
+    const auto source = diagnosticOrigin(job.url) + "/[path redacted]";
     if (!validHttpsUrl(job.url)) {
         job.errorMsg = "Download unavailable in this catalog";
         return false;
@@ -251,7 +263,11 @@ bool Fetcher::httpDownload(DownloadJob& job, std::string& partial) {
         return false;
     }
     HttpRequest request;
-    if (!request.open(httpTemplate_, job.url, job.errorMsg, job.id.c_str())) return false;
+    if (!request.open(httpTemplate_, job.url, job.errorMsg, job.id.c_str())) {
+        if (request.response) diagnostic("download", "Unexpected HTTP response", ErrorDomain::Http,
+                                         request.response, (context + " source=" + source).c_str());
+        return false;
+    }
     const int req = request.request;
     const auto expected = job.catalogBytes;
     size_t contentLen = 0;
@@ -262,8 +278,26 @@ bool Fetcher::httpDownload(DownloadJob& job, std::string& partial) {
     else
         contentLen = 0;
 
+    std::string contentType = request.responseHeader("content-type");
+    contentType = contentType.substr(0, contentType.find_first_of("; \t"));
+    for (char& c : contentType) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    if (contentType.size() > 64 || contentType.find_first_not_of(
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789!#$&^_.+-/") != std::string::npos)
+        contentType.clear();
+    const auto httpContext = job.id + " source=" + source + " http=" + std::to_string(request.response) +
+        " content_type=" + (contentType.empty() ? "unknown" : contentType) +
+        " content_length=" + (contentLen ? std::to_string(contentLen) : "unknown") +
+        " expected=" + std::to_string(expected);
+    diagnostic("download", "Response headers", ErrorDomain::Event, 0, httpContext.c_str());
+    const bool package = job.destPath.size() > 4 &&
+        job.destPath.compare(job.destPath.size() - 4, 4, ".pkg") == 0;
+    if (package && (contentType == "text/html" || contentType == "application/json")) {
+        job.errorMsg = diagnostic("download", "Unexpected content type", ErrorDomain::Event, 0,
+                                  httpContext.c_str());
+        return false;
+    }
     if (expected && contentLen && expected != contentLen) {
-        job.errorMsg = diagnostic("download", "HTTP length differs from catalog", ErrorDomain::Application, 0, context.c_str());
+        job.errorMsg = diagnostic("download", "HTTP length differs from catalog", ErrorDomain::Event, 0, httpContext.c_str());
         return false;
     }
     const uint64_t limit = expected ? expected : contentLen;
@@ -274,6 +308,7 @@ bool Fetcher::httpDownload(DownloadJob& job, std::string& partial) {
         return false;
     }
 
+    job.state = DownloadState::Downloading;
     char buf[HTTP_BUF];
     int read = -1;
     uint64_t prev  = 0;
@@ -307,12 +342,23 @@ bool Fetcher::httpDownload(DownloadJob& job, std::string& partial) {
         job.errorMsg = diagnostic("download", "Close temporary file", ErrorDomain::Posix, errno, context.c_str());
     const bool complete = job.errorMsg.empty() && transferComplete(
         read == 0, !running_ || !publishProgress(job), job.bytesDown, expected, contentLen);
-    const bool package = job.destPath.size() > 4 &&
-        job.destPath.compare(job.destPath.size() - 4, 4, ".pkg") == 0;
-    if (complete && (!package || isCompletePackage(partial, job.bytesDown))) return true;
-    if (job.errorMsg.empty() && running_ && publishProgress(job))
-        job.errorMsg = diagnostic("download", complete ? "Invalid package structure" : "Incomplete transfer",
-                                  ErrorDomain::Application, 0, context.c_str());
+    if (complete) {
+        job.state = DownloadState::Validating;
+        if (!publishProgress(job)) return false;
+        if (!package) return true;
+        const auto result = inspectPackageDetails(partial, job.bytesDown);
+        const bool supported = result && matchesPackageRole(result.info, job.role);
+        if (supported) return true;
+        job.rejected = true;
+        const auto details = context + " received=" + std::to_string(job.bytesDown) +
+            " " + describePackage(result, job.bytesDown);
+        job.errorMsg = diagnostic("download", result ? "Unsupported package type" : result.reason,
+            result.ioError ? ErrorDomain::Posix : ErrorDomain::Event, result.ioError, details.c_str());
+    } else if (job.errorMsg.empty() && running_ && publishProgress(job)) {
+        job.errorMsg = diagnostic("download", "Incomplete transfer", ErrorDomain::Event, 0,
+            (context + " received=" + std::to_string(job.bytesDown) + " expected=" +
+             std::to_string(expected) + " http_length=" + std::to_string(contentLen)).c_str());
+    }
     return false;
 }
 
@@ -321,21 +367,21 @@ bool Fetcher::httpDownload(DownloadJob& job, std::string& partial) {
 // ─────────────────────────────────────────────
 
 void Fetcher::workerLoop() {
+    const auto removed = cleanupInterruptedDownloads(DOWNLOAD_DIR);
+    if (removed) diagnostic("download", "Cleaned interrupted transfers", ErrorDomain::Event, 0,
+                            ("count=" + std::to_string(removed)).c_str());
+    rejectedBytes_ = rejected_.size();
     while (running_) {
+        if (clearRejected_.exchange(false)) {
+            if (!rejected_.clear())
+                diagnostic("download", "Delete rejected sample", ErrorDomain::Posix, errno, REJECTED_DOWNLOAD);
+            rejectedBytes_ = rejected_.size();
+        }
         std::function<void()> request;
         DownloadJob active;
         {
             std::lock_guard<std::mutex> lock(qMu_);
-            for (auto& job : queue_) {
-                if (job.state == InstallState::Queued && !job.paused) {
-                    job.bytesDown = 0;
-                    job.totalBytes = job.catalogBytes;
-                    job.errorMsg.clear();
-                    job.state = InstallState::Downloading;
-                    active = job;
-                    break;
-                }
-            }
+            active = beginNextDownload(queue_);
             if (active.id.empty() && !requests_.empty()) {
                 request = std::move(requests_.front());
                 requests_.pop_front();
@@ -358,10 +404,11 @@ void Fetcher::workerLoop() {
             }
             int publishError = 0;
             bool published = false;
+            bool retainRejected = false;
             {
                 std::lock_guard<std::mutex> lock(qMu_);
                 for (auto& job : queue_) {
-                    if (job.generation == active.generation && job.state == InstallState::Downloading) {
+                    if (job.generation == active.generation && activeDownload(job.state)) {
                         if (ok && !job.paused && running_) {
                             published = rename(partial.c_str(), job.destPath.c_str()) == 0;
                             if (!published) {
@@ -373,12 +420,20 @@ void Fetcher::workerLoop() {
                         job.totalBytes = published && !active.totalBytes ? active.bytesDown : active.totalBytes;
                         job.bytesDown = active.bytesDown;
                         job.speedBps = 0;
-                        job.state = published ? InstallState::Done : InstallState::Error;
+                        job.state = published ? DownloadState::Completed : DownloadState::Failed;
+                        retainRejected = active.rejected && !job.paused && running_ && keepRejected_;
                         break;
                     }
                 }
             }
-            if (!published && !partial.empty()) remove(partial.c_str());
+            if (!published && !partial.empty()) {
+                if (retainRejected && rejected_.keep(partial)) {
+                    rejectedBytes_ = rejected_.size();
+                    diagnostic("download", "Preserved rejected sample", ErrorDomain::Event, 0, REJECTED_DOWNLOAD);
+                } else {
+                    remove(partial.c_str());
+                }
+            }
             if (publishError) diagnostic("download", "Publish package", ErrorDomain::Posix,
                                          publishError, active.destPath.c_str());
             if (published) diagnostic("download", "Download complete", ErrorDomain::Event, 0, active.id.c_str());
@@ -391,7 +446,8 @@ void Fetcher::workerLoop() {
 bool Fetcher::publishProgress(const DownloadJob& active) {
     std::lock_guard<std::mutex> lock(qMu_);
     for (auto& job : queue_) {
-        if (job.generation == active.generation && job.state == InstallState::Downloading) {
+        if (job.generation == active.generation && activeDownload(job.state)) {
+            job.state = active.state;
             job.totalBytes = active.totalBytes;
             job.bytesDown = active.bytesDown;
             job.speedBps = active.speedBps;
@@ -445,78 +501,117 @@ std::string Fetcher::manifestStatus() const {
     return manifestStatus_;
 }
 
-std::shared_ptr<SDL_Surface> Fetcher::thumbnail(const std::string& url, const std::string& cacheKey) {
-    if (url.empty() || !running_) return {};
+void Fetcher::localPreviewLoop() {
+    while (running_) {
+        std::function<void()> load;
+        {
+            std::unique_lock<std::mutex> lock(qMu_);
+            previewReady_.wait(lock, [this] { return !running_ || !localPreviews_.empty(); });
+            if (!running_) break;
+            load = std::move(localPreviews_.front());
+            localPreviews_.pop_front();
+        }
+        try {
+            load();
+        } catch (const std::exception&) {
+            diagnostic("preview", "Local preview worker failed", ErrorDomain::Event);
+        }
+    }
+}
+
+Preview Fetcher::thumbnail(const std::string& url, const std::string& cacheKey) {
+    if (url.empty()) return {};
     const std::string bundled = "/app0/assets/images/" + cacheKey + ".png";
     const bool local = url == bundled;
-    if (!local && !validHttpsUrl(url)) return {};
+    if (!running_ || (!local && !validHttpsUrl(url))) return {{}, PreviewState::Failed};
     const auto key = cacheKey + "\n" + url;
     std::lock_guard<std::mutex> lock(qMu_);
     const auto found = thumbnails_.find(key);
     if (found != thumbnails_.end()) return found->second;
-    if (requests_.size() >= 24) return {};
+    if (local && !previewWorker_.joinable()) return {{}, PreviewState::Failed};
+    auto& pending = local ? localPreviews_ : requests_;
+    if (pending.size() >= 24) return {{}, PreviewState::Loading};
     if (thumbnailOrder_.size() >= 48) {
         thumbnails_.erase(thumbnailOrder_.front());
         thumbnailOrder_.pop_front();
     }
     thumbnailOrder_.push_back(key);
-    thumbnails_.emplace(key, nullptr);
-    requests_.push_back([this, url, cacheKey, key, local] {
-        std::shared_ptr<SDL_Surface> image;
-        const auto tryFile = [](const std::string& path) {
-            struct stat info{};
-            if (stat(path.c_str(), &info) != 0 || !S_ISREG(info.st_mode) ||
-                info.st_size <= 0 || info.st_size > 2 * 1024 * 1024) return static_cast<SDL_Surface*>(nullptr);
-            std::ifstream file(path, std::ios::binary);
-            std::string body(static_cast<size_t>(info.st_size), '\0');
-            if (!file.read(body.data(), body.size())) return static_cast<SDL_Surface*>(nullptr);
-            return decodePreview(body);
+    thumbnails_.emplace(key, Preview{{}, PreviewState::Loading});
+    pending.push_back([this, url, cacheKey, key, local] {
+        Preview result{{}, PreviewState::Failed};
+        const auto publish = [&] {
+            std::lock_guard<std::mutex> guard(qMu_);
+            const auto slot = thumbnails_.find(key);
+            if (slot != thumbnails_.end()) slot->second = std::move(result);
         };
+        const auto logError = [&](const PreviewError& error, const std::string& path) {
+            const auto context = cacheKey + " path=" + path + " " + error.detail;
+            diagnostic("preview", error.stage ? error.stage : "Unknown image failure",
+                       error.ioError ? ErrorDomain::Posix : ErrorDomain::Event,
+                       error.ioError, context.c_str());
+        };
+        PreviewError imageError;
+        std::shared_ptr<SDL_Surface> image;
         if (local) {
-            image.reset(tryFile(url), SDL_FreeSurface);
+            image.reset(loadPreviewFile(url, &imageError), SDL_FreeSurface);
+            if (!image) logError(imageError, url);
         } else {
             uint32_t hash = 2166136261u;
             for (unsigned char c : url) hash = (hash ^ c) * 16777619u;
             const auto path = std::string(THUMB_DIR) + cacheKey + "-" + std::to_string(hash) + ".img";
-            if (cacheWritable_) image.reset(tryFile(path), SDL_FreeSurface);
+            if (cacheWritable_) {
+                image.reset(loadPreviewFile(path, &imageError), SDL_FreeSurface);
+                if (!image && imageError.ioError != ENOENT) logError(imageError, path);
+            }
             if (!image) {
                 std::string body, error;
-                if (!httpGet(url, body, 2 * 1024 * 1024, cacheKey.c_str(), error)) return;
-                image.reset(decodePreview(body), SDL_FreeSurface);
+                if (!httpGet(url, body, 2 * 1024 * 1024, cacheKey.c_str(), error)) {
+                    diagnostic("preview", "Fetch remote image", ErrorDomain::Event, 0,
+                        (cacheKey + " source=" + diagnosticOrigin(url) + " " + error).c_str());
+                    publish();
+                    return;
+                }
+                image.reset(decodePreview(body, &imageError), SDL_FreeSurface);
+                if (!image) logError(imageError, diagnosticOrigin(url));
                 if (image && cacheWritable_) {
                     const auto partial = path + ".part";
                     std::ofstream file(partial, std::ios::binary);
                     file.write(body.data(), body.size());
                     file.close();
                     if (!file || rename(partial.c_str(), path.c_str()) != 0) {
-                        diagnostic("preview", "Write cache", ErrorDomain::Posix, errno, cacheKey.c_str());
+                        const int code = errno;
                         remove(partial.c_str());
+                        diagnostic("preview", "Write cache", ErrorDomain::Posix, code, path.c_str());
                     }
                 }
             }
         }
-        if (!image) {
-            diagnostic("preview", "Open or decode PNG/JPEG", ErrorDomain::Application, 0, cacheKey.c_str());
-            return;
-        }
-        const auto longest = std::max(image->w, image->h);
-        if (longest > 384) {
-            const int width = std::max(1, int(int64_t(image->w) * 384 / longest));
-            const int height = std::max(1, int(int64_t(image->h) * 384 / longest));
-            std::shared_ptr<SDL_Surface> resized(
-                SDL_CreateRGBSurfaceWithFormat(0, width, height, 32, SDL_PIXELFORMAT_RGBA32), SDL_FreeSurface);
-            SDL_SetSurfaceBlendMode(image.get(), SDL_BLENDMODE_NONE);
-            if (!resized || SDL_BlitScaled(image.get(), nullptr, resized.get(), nullptr) < 0) {
-                diagnostic("preview", "Resize image", ErrorDomain::Application, 0, cacheKey.c_str());
-                return;
+        if (image) {
+            const auto longest = std::max(image->w, image->h);
+            if (longest > 384) {
+                const int width = std::max(1, int(int64_t(image->w) * 384 / longest));
+                const int height = std::max(1, int(int64_t(image->h) * 384 / longest));
+                const auto* format = image->format;
+                std::shared_ptr<SDL_Surface> resized(SDL_CreateRGBSurface(
+                    0, width, height, 32, format->Rmask, format->Gmask, format->Bmask, format->Amask),
+                    SDL_FreeSurface);
+                SDL_SetSurfaceBlendMode(image.get(), SDL_BLENDMODE_NONE);
+                if (!resized || SDL_BlitScaled(image.get(), nullptr, resized.get(), nullptr) < 0) {
+                    diagnostic("preview", "Resize image", ErrorDomain::Event, 0,
+                               (cacheKey + " " + SDL_GetError()).c_str());
+                    publish();
+                    return;
+                }
+                image = std::move(resized);
             }
-            image = std::move(resized);
+            result = {std::move(image), local ? PreviewState::Illustration : PreviewState::Ready};
+            diagnostic("preview", local ? "Loaded packaged illustration" : "Decoded remote or cached image",
+                       ErrorDomain::Event, 0, cacheKey.c_str());
         }
-        std::lock_guard<std::mutex> guard(qMu_);
-        const auto slot = thumbnails_.find(key);
-        if (slot != thumbnails_.end()) slot->second = std::move(image);
+        publish();
     });
-    return {};
+    if (local) previewReady_.notify_one();
+    return {{}, PreviewState::Loading};
 }
 
 void Fetcher::enqueue(DownloadJob job) {
@@ -524,13 +619,14 @@ void Fetcher::enqueue(DownloadJob job) {
     job.generation = ++generation_;
     job.catalogBytes = job.totalBytes;
     if (!running_) {
-        job.state = InstallState::Error;
+        job.state = DownloadState::Failed;
         job.errorMsg = "Network worker unavailable";
     }
     // Avoid duplicate
     for (auto& existing : queue_) {
         if (existing.id == job.id && existing.url == job.url) {
-            if (existing.state == InstallState::Error || existing.state == InstallState::Done)
+            if (existing.state == DownloadState::Failed || existing.state == DownloadState::Completed ||
+                existing.state == DownloadState::Cancelled)
                 existing = std::move(job);
             return;
         }
@@ -548,22 +644,22 @@ void Fetcher::resume(const std::string& id) {
     for (auto& j : queue_) {
         if (j.id == id) {
             j.paused = false;
-            if (j.state == InstallState::Error) j.state = InstallState::Queued;
+            if (j.state == DownloadState::Failed) j.state = DownloadState::Queued;
         }
     }
 }
 
 void Fetcher::cancel(const std::string& id) {
-    std::lock_guard<std::mutex> lk(qMu_);
-    queue_.erase(std::remove_if(queue_.begin(), queue_.end(),
-        [&id](const DownloadJob& j){ return j.id == id; }), queue_.end());
+    std::lock_guard<std::mutex> lock(qMu_);
+    cancelOrDismiss(queue_, id);
 }
 
 void Fetcher::retry(const std::string& id) {
     std::lock_guard<std::mutex> lk(qMu_);
     for (auto& j : queue_) {
-        if (j.id == id && j.state == InstallState::Error) {
-            j.state = InstallState::Queued;
+        if (j.id == id && (j.state == DownloadState::Failed || j.state == DownloadState::Cancelled)) {
+            j.state = DownloadState::Queued;
+            j.paused = false;
             j.bytesDown = 0;
             j.errorMsg.clear();
         }
@@ -578,7 +674,7 @@ std::vector<DownloadJob> Fetcher::queueSnapshot() {
 bool Fetcher::isDownloading() const {
     std::lock_guard<std::mutex> lk(qMu_);
     for (auto& j : queue_)
-        if (j.state == InstallState::Downloading) return true;
+        if (activeDownload(j.state)) return true;
     return false;
 }
 
@@ -586,6 +682,6 @@ int Fetcher::activeCount() const {
     std::lock_guard<std::mutex> lk(qMu_);
     int n = 0;
     for (auto& j : queue_)
-        if (j.state == InstallState::Downloading || j.state == InstallState::Queued) ++n;
+        if (activeDownload(j.state) || j.state == DownloadState::Queued) ++n;
     return n;
 }

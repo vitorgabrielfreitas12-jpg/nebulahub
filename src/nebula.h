@@ -5,7 +5,7 @@
 // ─────────────────────────────────────────────
 
 #define APP_TITLE        "NEBULA HUB"
-#define APP_VERSION      "1.0.1"
+#define APP_VERSION      "1.0.2"
 #define TITLE_ID         "NEBU00001"
 
 #define SCREEN_W         1920
@@ -17,6 +17,7 @@
 // Local paths. Actual write access is checked before using them.
 #define DATA_DIR         "/data/NEBULAHUB/"
 #define DOWNLOAD_DIR     "/data/NEBULAHUB/downloads/"
+#define REJECTED_DOWNLOAD DATA_DIR "diagnostic-rejected.bin"
 #define CACHE_DIR        "/data/NEBULAHUB/cache/"
 #define AVATAR_DEST      "/data/AVATARS/"
 #define PKG_INSTALL_DIR  "/data/pkg/"

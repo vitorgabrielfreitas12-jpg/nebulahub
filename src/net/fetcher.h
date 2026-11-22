@@ -1,10 +1,14 @@
 #pragma once
 #include "../nebula.h"
 #include "../db/database.h"
+#include "rejected.h"
+#include "../install/package.h"
+#include <algorithm>
 #include <string>
 #include <cstdint>
 #include <cstdio>
 #include <functional>
+#include <condition_variable>
 #include <vector>
 #include <atomic>
 #include <thread>
@@ -18,6 +22,19 @@
 //  Download job
 // ─────────────────────────────────────────────
 
+enum class DownloadState { Queued, Connecting, Downloading, Validating, Completed, Failed, Cancelled };
+
+inline bool activeDownload(DownloadState state) {
+    return state == DownloadState::Connecting || state == DownloadState::Downloading ||
+           state == DownloadState::Validating;
+}
+
+enum class PreviewState { Missing, Loading, Ready, Illustration, Failed };
+struct Preview {
+    std::shared_ptr<SDL_Surface> image;
+    PreviewState state = PreviewState::Missing;
+};
+
 struct DownloadJob {
     uint64_t generation = 0;
     std::string  id;           // content entry id
@@ -27,7 +44,9 @@ struct DownloadJob {
     uint64_t     catalogBytes = 0;
     uint64_t     bytesDown    = 0;
     float        speedBps     = 0.f;
-    InstallState state        = InstallState::Queued;
+    DownloadState state = DownloadState::Queued;
+    bool rejected = false;
+    PackageRole role = PackageRole::None;
     std::string  errorMsg;
     bool         paused       = false;
 
@@ -56,6 +75,33 @@ struct DownloadJob {
     }
 };
 
+inline DownloadJob beginNextDownload(std::vector<DownloadJob>& queue) {
+    if (std::any_of(queue.begin(), queue.end(), [](const auto& job) { return activeDownload(job.state); }))
+        return {};
+    for (auto& job : queue) {
+        if (job.state != DownloadState::Queued || job.paused) continue;
+        job.bytesDown = 0;
+        job.totalBytes = job.catalogBytes;
+        job.errorMsg.clear();
+        job.state = DownloadState::Connecting;
+        return job;
+    }
+    return {};
+}
+
+inline void cancelOrDismiss(std::vector<DownloadJob>& queue, const std::string& id) {
+    const auto found = std::find_if(queue.begin(), queue.end(), [&](const auto& job) { return job.id == id; });
+    if (found == queue.end()) return;
+    if (found->state == DownloadState::Queued || activeDownload(found->state)) {
+        found->state = DownloadState::Cancelled;
+        found->paused = false;
+        found->speedBps = 0;
+    } else {
+        // Removing history does not remove the file.
+        queue.erase(found);
+    }
+}
+
 // ─────────────────────────────────────────────
 //  Fetcher
 // ─────────────────────────────────────────────
@@ -68,7 +114,7 @@ public:
     void fetchManifestAsync(const std::string& url);
     std::unique_ptr<Database> takeManifest();
     std::string manifestStatus() const;
-    std::shared_ptr<SDL_Surface> thumbnail(const std::string& url, const std::string& cacheKey);
+    Preview thumbnail(const std::string& url, const std::string& cacheKey);
 
     // Download queue
     void enqueue(DownloadJob job);
@@ -76,6 +122,10 @@ public:
     void resume(const std::string& id);
     void cancel(const std::string& id);
     void retry(const std::string& id);
+    bool keepingRejected() const { return keepRejected_; }
+    void toggleKeepRejected() { keepRejected_ = !keepRejected_; }
+    uint64_t rejectedBytes() const { return rejectedBytes_; }
+    void requestClearRejected() { clearRejected_ = true; }
 
     std::vector<DownloadJob> queueSnapshot();
 
@@ -84,9 +134,16 @@ public:
 
 private:
     std::deque<std::function<void()>> requests_;
-    std::unordered_map<std::string, std::shared_ptr<SDL_Surface>> thumbnails_;
+    std::deque<std::function<void()>> localPreviews_;
+    std::condition_variable previewReady_;
+    std::thread previewWorker_;
+    std::unordered_map<std::string, Preview> thumbnails_;
     std::deque<std::string> thumbnailOrder_;
     uint64_t generation_ = 0;
+    RejectedDownload rejected_{REJECTED_DOWNLOAD};
+    std::atomic<bool> keepRejected_{false};
+    std::atomic<bool> clearRejected_{false};
+    std::atomic<uint64_t> rejectedBytes_{0};
     bool cacheWritable_ = false;
     std::string networkError_;
     std::unique_ptr<Database> manifestCache_;
@@ -98,6 +155,7 @@ private:
     std::atomic<bool>        running_{true};
 
     void workerLoop();
+    void localPreviewLoop();
     bool publishProgress(const DownloadJob& active);
     bool httpGet(const std::string& url, std::string& body, size_t limit, const char* item,
                  std::string& error);
