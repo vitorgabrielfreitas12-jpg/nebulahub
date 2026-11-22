@@ -12,7 +12,6 @@ import urllib.request
 import urllib.parse
 import json
 import re
-import sys
 import argparse
 import time
 import os
@@ -79,7 +78,8 @@ def parse_theme_listing(html):
     # Find all .pkg files in the listing
     files = re.findall(r'href="([^"]+\.pkg)"', html)
     # Decode URL-encoded names
-    files = [urllib.parse.unquote(f) for f in files]
+    files = [urllib.parse.unquote(f) for f in files
+             if not urllib.parse.urlsplit(f).netloc and "/" not in f]
     return files
 
 def build_theme_pairs(files):
@@ -256,7 +256,7 @@ def main():
         "entries":       all_entries
     }
 
-    os.makedirs(os.path.dirname(args.output), exist_ok=True)
+    os.makedirs(os.path.dirname(args.output) or ".", exist_ok=True)
     with open(args.output, "w", encoding="utf-8") as f:
         json.dump(manifest, f, indent=2, ensure_ascii=False)
 

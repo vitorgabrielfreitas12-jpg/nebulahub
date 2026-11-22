@@ -87,7 +87,6 @@ private:
 
     void refreshEntries(ScreenCtx& ctx);
     void drawCard(ScreenCtx& ctx, ContentEntry* e, int x, int y, bool focused);
-    void loadThumb(ScreenCtx& ctx, ContentEntry* e);
 };
 
 class SearchScreen : public Screen {
@@ -96,12 +95,12 @@ public:
     void update(ScreenCtx& ctx) override;
     void render(ScreenCtx& ctx) override;
 private:
+    size_t searchChar_ = 0;
     std::string query_;
     int         filterMode_ = 0;  // 0=all 1=avatars 2=themes 3=animated
     std::vector<ContentEntry*> results_;
     int   selIdx_ = 0;
     float scroll_ = 0.f;
-    bool  kbActive_ = false;
 
     void doSearch(ScreenCtx& ctx);
     void drawResultCard(ScreenCtx& ctx, ContentEntry* e, int y, bool focused);
@@ -114,10 +113,7 @@ public:
     void render(ScreenCtx& ctx) override;
 private:
     ContentEntry*  entry_;
-    SDL_Texture*   preview_   = nullptr;
-    bool           thumbLoaded_ = false;
     int            btnIdx_    = 0;  // 0=download/install  1=favorite  2=back
-    float          pulse_     = 0.f;
     std::string    statusMsg_;
     bool           downloading_ = false;
 };
@@ -128,7 +124,6 @@ public:
     void render(ScreenCtx& ctx) override;
 private:
     int   selIdx_ = 0;
-    float scroll_ = 0.f;
 };
 
 class FavoritesScreen : public Screen {
@@ -137,7 +132,6 @@ public:
     void render(ScreenCtx& ctx) override;
 private:
     int   selIdx_ = 0;
-    float scroll_ = 0.f;
     std::vector<ContentEntry*> favs_;
 };
 

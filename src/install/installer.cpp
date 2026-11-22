@@ -1,19 +1,17 @@
 // NEBULA HUB — Installer
 // Avatar path: copy xavatar → /data/AVATARS/
-// Theme path:  copy PKGs → /data/pkg/ then trigger sceSystemServiceInstallUpdate
+// Theme path: stage the PKG pair in /data/pkg/ and submit the stub.
 
 #include "installer.h"
 
-#include <orbis/SystemService.h>
-#include <orbis/UserService.h>
+#include <orbis/AppInstUtil.h>
+#include <orbis/Sysmodule.h>
 #include <orbis/libkernel.h>
 
 #include <cstdio>
-#include <cstring>
 #include <sys/stat.h>
-#include <unistd.h>
 
-Installer::Installer(OrbisUserServiceUserId userId) : userId_(userId) {
+Installer::Installer() {
     ensureDir(AVATAR_DEST);
     ensureDir(PKG_INSTALL_DIR);
 }
@@ -25,7 +23,8 @@ void Installer::ensureDir(const std::string& path) {
 bool Installer::copyFile(const std::string& src, const std::string& dst) {
     FILE* fin  = fopen(src.c_str(), "rb");
     if (!fin) return false;
-    FILE* fout = fopen(dst.c_str(), "wb");
+    const std::string partial = dst + ".part";
+    FILE* fout = fopen(partial.c_str(), "wb");
     if (!fout) { fclose(fin); return false; }
 
     char buf[64 * 1024];
@@ -34,8 +33,11 @@ bool Installer::copyFile(const std::string& src, const std::string& dst) {
     while ((n = fread(buf, 1, sizeof(buf), fin)) > 0) {
         if (fwrite(buf, 1, n, fout) != n) { ok = false; break; }
     }
+    ok = ok && !ferror(fin);
     fclose(fin);
-    fclose(fout);
+    if (fclose(fout) != 0) ok = false;
+    if (ok) ok = rename(partial.c_str(), dst.c_str()) == 0;
+    if (!ok) remove(partial.c_str());
     return ok;
 }
 
@@ -56,7 +58,7 @@ bool Installer::installAvatar(const ContentEntry& entry,
         bool ok = launchPkgInstall(entry.localPath);
         if (ok) {
             notify("NEBULA HUB",
-                   "Avatar pack installed! Open Avatar Changer (LAPY) to apply.");
+                   "Avatar pack submitted. Open Avatar Changer (LAPY) to apply.");
             cb(true, "");
         } else {
             cb(false, "PKG install failed");
@@ -101,7 +103,7 @@ bool Installer::installTheme(const ContentEntry& entry,
         return false;
     }
 
-    // Trigger install of the stub — PS4 picks up the payload automatically
+    // Submit the stub after both parts are staged.
     bool ok = launchPkgInstall(stub);
     if (ok) {
         notify("NEBULA HUB",
@@ -118,16 +120,11 @@ bool Installer::installTheme(const ContentEntry& entry,
 // ─────────────────────────────────────────────
 
 bool Installer::launchPkgInstall(const std::string& pkgPath) {
-    // sceSystemServiceInstallUpdate — takes path to PKG
-    int ret = sceSystemServiceInstallUpdate(pkgPath.c_str());
+    if (sceSysmoduleLoadModuleInternal(ORBIS_SYSMODULE_INTERNAL_APP_INST_UTIL) < 0) return false;
+    if (sceAppInstUtilInitialize() < 0) return false;
+    const int ret = sceAppInstUtilAppInstallPkg(pkgPath.c_str(), nullptr);
+    sceAppInstUtilTerminate();
     return ret >= 0;
-}
-
-bool Installer::isPkgInstallPending(const std::string& contentId) {
-    // Check if file still exists in pkg dir (rough heuristic)
-    std::string p = std::string(PKG_INSTALL_DIR) + contentId + "_1.pkg";
-    struct stat st{};
-    return stat(p.c_str(), &st) == 0;
 }
 
 // ─────────────────────────────────────────────
@@ -136,8 +133,10 @@ bool Installer::isPkgInstallPending(const std::string& contentId) {
 
 void Installer::notify(const std::string& title, const std::string& msg) {
     // PS4 toast notification — same API used by most homebrews
-    OrbisSystemServiceParamId params{};
-    sceSystemServiceLoadExec("notification", nullptr);
-    // Fallback: simple printf to klog
+    OrbisNotificationRequest request{};
+    request.type = NotificationRequest;
+    request.targetId = -1;
+    snprintf(request.message, sizeof(request.message), "%s: %s", title.c_str(), msg.c_str());
+    sceKernelSendNotificationRequest(0, &request, sizeof(request), 0);
     printf("[NEBULA HUB] %s: %s\n", title.c_str(), msg.c_str());
 }

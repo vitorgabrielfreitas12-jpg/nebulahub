@@ -12,8 +12,7 @@
 #define SCREEN_H         1080
 
 // Remote manifest — hosted on GitHub Pages (update this URL after deploy)
-#define MANIFEST_URL     "https://YamatoXSF.github.io/nebulahub-cdn/manifest.json"
-#define CDN_BASE         "https://YamatoXSF.github.io/nebulahub-cdn"
+#define MANIFEST_URL     ""
 
 // Local paths (all writable on GoldHEN)
 #define DATA_DIR         "/data/NEBULAHUB/"
@@ -36,8 +35,8 @@
 #define COL_SUCCESS      0x2BFFB1FF
 
 // Fonts (embedded in PKG sce_sys)
-#define FONT_REGULAR     "embedded://assets/fonts/NotoSans-Regular.ttf"
-#define FONT_BOLD        "embedded://assets/fonts/NotoSans-Bold.ttf"
+#define FONT_REGULAR     "/app0/assets/fonts/DejaVuSans.ttf"
+#define FONT_BOLD        "/app0/assets/fonts/DejaVuSans-Bold.ttf"
 
 // Content types
 enum class ContentType { Avatar, Theme };
@@ -45,25 +44,6 @@ enum class ThemeKind   { Static, Dynamic };
 enum class InstallState {
     None, Queued, Downloading, Installing, Done, Error
 };
-
-// DualShock 4 button masks
-#define PAD_BUTTON_CROSS    0x0004
-#define PAD_BUTTON_CIRCLE   0x0002
-#define PAD_BUTTON_SQUARE   0x0080
-#define PAD_BUTTON_TRIANGLE 0x0010
-#define PAD_BUTTON_L1       0x0400
-#define PAD_BUTTON_R1       0x0800
-#define PAD_BUTTON_L2       0x0100
-#define PAD_BUTTON_R2       0x0200
-#define PAD_BUTTON_UP       0x0010
-#define PAD_BUTTON_DOWN     0x0040
-#define PAD_BUTTON_LEFT     0x0020
-#define PAD_BUTTON_RIGHT    0x0080
-#define PAD_BUTTON_OPTIONS  0x0008
-#define PAD_BUTTON_DPAD_UP    0x0010
-#define PAD_BUTTON_DPAD_DOWN  0x0040
-#define PAD_BUTTON_DPAD_LEFT  0x0020
-#define PAD_BUTTON_DPAD_RIGHT 0x0080
 
 // Screen IDs
 enum class ScreenID {

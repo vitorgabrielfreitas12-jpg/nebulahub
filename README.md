@@ -1,16 +1,15 @@
 # ✦ NEBULA HUB
 
 **The ultimate PS4 avatar and theme library**
-1,000+ avatars · 1,500+ themes · animated dynamic themes · DualShock 4 navigation
+Avatar packs · static and dynamic themes · DualShock 4 navigation
 
 ---
 
 ## What it is
 
 NEBULA HUB is a native PS4 homebrew application (`.pkg`) you install on a jailbroken PS4.
-It connects to a remote manifest, lets you browse thousands of avatars and themes by category,
-search by name or series (Naruto, God of War, etc.), download them, and install them directly
-from the app.
+It ships with a catalog of 25 entries. Browse and search avatar packs and themes,
+download files, and submit installation requests from the preview screen.
 
 ---
 
@@ -63,44 +62,42 @@ This is the **recommended path** if you're on Android.
 
 ### Step 5 — Install on PS4
 
-**Option A — USB**
-1. Format a USB drive as exFAT on your phone/PC
-2. Create folder: `PS4/UPDATE/` (or just root)
-3. Copy `nebulahub.pkg` to the USB root
-4. Plug into PS4
-5. GoldHEN → **Package Installer** → select the PKG → install
+Copy `nebulahub.pkg` to the root of an exFAT USB drive and select it in GoldHEN's
+Package Installer. Installation and launch on firmware 14.00 require a compatible
+GoldHEN setup and validation on that console.
 
-**Option B — Network (Remote PKG Install)**
-1. On PS4, go to **Settings** → **Remote Play Connection Settings** (or use GoldHEN's built-in HTTP)
-2. Use **Direct Package Installer** on your phone to send the PKG over WiFi
-   - App: [github.com/devcrono/DirectPackageInstaller](https://github.com/devcrono/DirectPackageInstaller) (Android build available)
+## Local build
 
----
+Use x86-64 Ubuntu 24.04 with Clang and LLD 18. GitHub Actions runs the same commands.
 
-## CUSTOMIZE THE MANIFEST URL
-
-Before uploading, open `src/nebula.h` and replace:
-
-```cpp
-#define MANIFEST_URL "https://your-username.github.io/nebulahub-cdn/manifest.json"
-#define CDN_BASE     "https://your-username.github.io/nebulahub-cdn"
+```bash
+sudo apt-get update
+sudo apt-get install --no-install-recommends \
+  clang-18 lld-18 binutils make curl imagemagick fonts-dejavu-core dotnet-sdk-8.0
+bash scripts/bootstrap-sdk.sh
+make -j"$(nproc)"
+make verify
 ```
 
-with your actual GitHub Pages URL (or any HTTPS server you control).
+The bootstrap checks the SHA-256 of the OpenOrbis 0.5.4 release, SDL_ttf 2.0.15
+source and header, nlohmann/json 3.11.3, and a pinned LibOrbisPkg revision.
+The SDK supplies the target libc++, SDL2, SDL_image, startup object and ELF
+conversion tools. The bootstrap builds PkgTool.Core with .NET 8 for OpenSSL 3. SDL_ttf links against the SDK's
+FreeType exports. The build creates `build/eboot.elf`, `build/eboot.oelf`,
+`build/pkg/eboot.bin` and `nebulahub.pkg`. Verification reads the ELF and OELF,
+checks the PKG and compares its extracted payload with the staged files.
 
-**To host the manifest on GitHub Pages for free:**
+## Catalog URL
 
-1. Create a new repo called `nebulahub-cdn`
-2. Go to **Settings** → **Pages** → Source: main branch / root
-3. Upload `manifest/manifest.json` to that repo
-4. Your manifest URL will be: `https://YOUR_USERNAME.github.io/nebulahub-cdn/manifest.json`
-5. Regenerate the manifest with more entries:
-   ```bash
-   python3 scripts/gen_manifest.py --output manifest/manifest.json
-   ```
-   Then upload the new `manifest.json` to `nebulahub-cdn`
+The packaged manifest is available on first launch without a catalog server.
+Set `MANIFEST_URL` in `src/nebula.h` to your HTTPS manifest URL to enable refreshes.
+The catalog entries still need reachable media URLs for previews and downloads.
 
----
+To generate a separate manifest from the archive listing:
+
+```bash
+python3 scripts/gen_manifest.py --output /tmp/nebula-manifest.json
+```
 
 ## USING THE APP
 
@@ -110,81 +107,28 @@ with your actual GitHub Pages URL (or any HTTPS server you control).
 | ✕ | Select / confirm |
 | ○ | Back |
 | △ | Favorite / unfavorite |
-| □ | Jump to search |
-| L1 / R1 | Filter tabs (in search) |
+| □ | Open search from a library or add the selected search character |
+| L1 / R1 | Filter search results |
 | OPTIONS | Back / quit |
 
 **To install an avatar:**
 1. Avatars → pick category → select item → ✕
 2. Preview screen → DOWNLOAD & INSTALL → ✕
 3. Wait for download (see Downloads screen)
-4. Launch **Avatar Changer (LAPY)** on your PS4 — the avatar will be there
+4. Press ✕ again to copy a single avatar or submit a pack installation request. Apply individual avatars through **Avatar Changer (LAPY)**.
 
 **To install a theme:**
 1. Themes → pick category → select item → ✕
 2. Preview screen → DOWNLOAD & INSTALL → ✕
 3. Both PKG parts download automatically
-4. Theme installs via GoldHEN's PKG installer
+4. Press ✕ again after both downloads to submit the installation request.
 5. Go to **Settings → Themes → My Themes** to apply
 
 ---
 
-## FILE STRUCTURE
+## Runtime verification
 
-```
-nebulahub/
-├── src/
-│   ├── main.cpp                 ← entry point
-│   ├── nebula.h                 ← constants / palette / defines
-│   ├── db/
-│   │   ├── database.h/cpp       ← content database + JSON parser
-│   ├── net/
-│   │   ├── fetcher.h/cpp        ← HTTP client + download queue
-│   ├── input/
-│   │   ├── controller.h/cpp     ← DualShock 4 input
-│   ├── install/
-│   │   ├── installer.h/cpp      ← avatar + theme PKG install
-│   └── ui/
-│       ├── renderer.h/cpp       ← SDL2 render wrapper
-│       └── screens.h/cpp        ← all 8 screens
-├── sce_sys/
-│   └── param.sfo.txt            ← app metadata descriptor
-├── assets/
-│   └── fonts/                   ← NotoSans (downloaded by build)
-├── manifest/
-│   └── manifest.json            ← seed content database (25 entries)
-├── scripts/
-│   └── gen_manifest.py          ← generate full manifest from archive.org
-├── .github/workflows/
-│   └── build.yml                ← GitHub Actions auto-build
-├── Makefile                     ← local build (OpenOrbis)
-└── README.md                    ← this file
-```
-
----
-
-## TROUBLESHOOTING
-
-| Problem | Fix |
-|---|---|
-| Build fails: `clang not found` | Actions runner installs it — wait for step 2 to complete |
-| Build fails: `PkgTool.Core not found` | AppVeyor link stale — download manually from LibOrbisPkg releases |
-| PKG installs but app crashes on launch | Missing SDL2 stubs in toolchain — ensure OpenOrbis release has SDL2_stub |
-| App opens but shows "No content" | Manifest URL in nebula.h is placeholder — set your CDN URL |
-| Download fails on PS4 | PS4 needs internet — test with GoldHEN's browser first |
-| Avatar doesn't appear in Avatar Changer | Avatar Changer (LAPY20015) must be installed separately |
-| Theme doesn't appear in Settings | PKG install may still be running — wait 60s and check |
-
----
-
-## ADDING MORE CONTENT
-
-Run the manifest generator to pull the full 1,500+ theme list from archive.org:
-
-```bash
-python3 scripts/gen_manifest.py --output manifest/manifest.json
-```
-
-Upload the new manifest to your `nebulahub-cdn` repo — no PKG rebuild needed.
-The app fetches the manifest on launch and updates its local database automatically.
-# trigger Fri Nov 20 09:29:48 CET 2026
+Use a PS4 to check installation, launch, DualShock 4 input, fonts and previews,
+download redirects and TLS, write permissions under `/data`, and persistence
+across restart. For theme pairs and avatar packs, verify that the console
+accepts the installation request and that the content appears after installation.

@@ -4,8 +4,22 @@
 #include "fetcher.h"
 
 #include <orbis/Net.h>
+#define sceHttpSetRecvTimeOut sdkSceHttpSetRecvTimeOut
+#define sceHttpSetAutoRedirect sdkSceHttpSetAutoRedirect
 #include <orbis/Http.h>
+#undef sceHttpSetRecvTimeOut
+#undef sceHttpSetAutoRedirect
+#define sceSslTerm sdkSceSslTerm
 #include <orbis/Ssl.h>
+#undef sceSslTerm
+#include <orbis/Sysmodule.h>
+
+// OpenOrbis 0.5.4 leaves these declarations untyped.
+extern "C" int sceHttpSetRecvTimeOut(int id, uint32_t usec);
+extern "C" int sceHttpSetAutoRedirect(int id, int enabled);
+extern "C" int sceSslTerm(int id);
+
+#include <algorithm>
 #include <orbis/libkernel.h>
 
 #include <cstring>
@@ -22,6 +36,10 @@
 // ─────────────────────────────────────────────
 
 Fetcher::Fetcher() {
+    mkdir(DATA_DIR, 0755);
+    mkdir(DOWNLOAD_DIR, 0755);
+    mkdir(CACHE_DIR, 0755);
+    mkdir(THUMB_DIR, 0755);
     initNet();
     worker_ = std::thread([this]{ workerLoop(); });
 }
@@ -33,29 +51,31 @@ Fetcher::~Fetcher() {
 }
 
 void Fetcher::initNet() {
-    SceNetInitParam p{};
-    p.memory = malloc(1 * 1024 * 1024);
-    p.size   = 1 * 1024 * 1024;
-    p.flags  = 0;
-    sceNetInit(&p);
-    sceNetCtlInit();
-
-    sceSslInit(0x40000);
-    sceHttpInit(0x40000);
-
-    netHandle_ = sceNetCtlGetInfo(SCE_NET_CTL_INFO_IP_ADDRESS, nullptr);
-    httpCtx_   = sceHttpCreateTemplate("NebulaHub/1.0", SCE_HTTP_VERSION_1_1, SCE_TRUE);
-    sceHttpSetConnectTimeOut(httpCtx_, 10 * 1000 * 1000);   // 10 s
-    sceHttpSetSendTimeOut(httpCtx_,    30 * 1000 * 1000);   // 30 s
-    sceHttpSetRecvTimeOut(httpCtx_,    30 * 1000 * 1000);
+    if (sceSysmoduleLoadModuleInternal(ORBIS_SYSMODULE_INTERNAL_NET) < 0 ||
+        sceSysmoduleLoadModuleInternal(ORBIS_SYSMODULE_INTERNAL_SSL) < 0 ||
+        sceSysmoduleLoadModuleInternal(ORBIS_SYSMODULE_INTERNAL_HTTP) < 0 ||
+        sceNetInit() < 0) return;
+    netInitialized_ = true;
+    netPool_ = sceNetPoolCreate("NebulaHub", 1024 * 1024, 0);
+    if (netPool_ < 0) return;
+    sslCtx_ = sceSslInit(0x40000);
+    if (sslCtx_ < 0) return;
+    httpCtx_ = sceHttpInit(netPool_, sslCtx_, 0x40000);
+    if (httpCtx_ < 0) return;
+    httpTemplate_ = sceHttpCreateTemplate(httpCtx_, "NebulaHub/1.0", ORBIS_HTTP_VERSION_1_1, 0);
+    if (httpTemplate_ < 0) return;
+    sceHttpSetAutoRedirect(httpTemplate_, 1);
+    sceHttpSetConnectTimeOut(httpTemplate_, 10 * 1000 * 1000);
+    sceHttpSetSendTimeOut(httpTemplate_, 30 * 1000 * 1000);
+    sceHttpSetRecvTimeOut(httpTemplate_, 30 * 1000 * 1000);
 }
 
 void Fetcher::freeNet() {
-    if (httpCtx_ >= 0) sceHttpDeleteTemplate(httpCtx_);
-    sceHttpTerm();
-    sceSslTerm();
-    sceNetCtlTerm();
-    sceNetTerm();
+    if (httpTemplate_ >= 0) sceHttpDeleteTemplate(httpTemplate_);
+    if (httpCtx_ >= 0) sceHttpTerm(httpCtx_);
+    if (sslCtx_ >= 0) sceSslTerm(sslCtx_);
+    if (netPool_ >= 0) sceNetPoolDestroy(netPool_);
+    if (netInitialized_) sceNetTerm();
 }
 
 // ─────────────────────────────────────────────
@@ -63,10 +83,11 @@ void Fetcher::freeNet() {
 // ─────────────────────────────────────────────
 
 bool Fetcher::httpGet(const std::string& url, std::string& body, std::string* errOut) {
-    int conn = sceHttpCreateConnectionWithURL(httpCtx_, url.c_str(), SCE_TRUE);
+    if (httpTemplate_ < 0) return false;
+    int conn = sceHttpCreateConnectionWithURL(httpTemplate_, url.c_str(), 1);
     if (conn < 0) { if (errOut) *errOut = "conn fail"; return false; }
 
-    int req = sceHttpCreateRequestWithURL(conn, SCE_HTTP_METHOD_GET, url.c_str(), 0);
+    int req = sceHttpCreateRequestWithURL(conn, ORBIS_METHOD_GET, url.c_str(), 0);
     if (req < 0) { sceHttpDeleteConnection(conn); return false; }
 
     int ret = sceHttpSendRequest(req, nullptr, 0);
@@ -82,9 +103,11 @@ bool Fetcher::httpGet(const std::string& url, std::string& body, std::string* er
 
     char buf[HTTP_BUF];
     body.clear();
-    int read;
-    while ((read = sceHttpReadData(req, buf, sizeof(buf))) > 0)
+    int read = -1;
+    while (running_ && (read = sceHttpReadData(req, buf, sizeof(buf))) > 0) {
+        if (body.size() + static_cast<size_t>(read) > 16 * 1024 * 1024) break;
         body.append(buf, read);
+    }
 
     sceHttpDeleteRequest(req);
     sceHttpDeleteConnection(conn);
@@ -92,10 +115,11 @@ bool Fetcher::httpGet(const std::string& url, std::string& body, std::string* er
 }
 
 bool Fetcher::httpDownload(DownloadJob& job) {
-    int conn = sceHttpCreateConnectionWithURL(httpCtx_, job.url.c_str(), SCE_TRUE);
+    if (httpTemplate_ < 0) { job.errorMsg = "network unavailable"; return false; }
+    int conn = sceHttpCreateConnectionWithURL(httpTemplate_, job.url.c_str(), 1);
     if (conn < 0) { job.errorMsg = "connection failed"; return false; }
 
-    int req = sceHttpCreateRequestWithURL(conn, SCE_HTTP_METHOD_GET, job.url.c_str(), 0);
+    int req = sceHttpCreateRequestWithURL(conn, ORBIS_METHOD_GET, job.url.c_str(), 0);
     if (req < 0) { sceHttpDeleteConnection(conn); return false; }
 
     if (sceHttpSendRequest(req, nullptr, 0) < 0) {
@@ -110,27 +134,36 @@ bool Fetcher::httpDownload(DownloadJob& job) {
         job.errorMsg = "HTTP " + std::to_string(status); return false;
     }
 
-    uint64_t contentLen = 0;
-    sceHttpGetContentLength(req, &contentLen);
-    job.totalBytes = contentLen;
+    size_t contentLen = 0;
+    int lengthType = 0;
+    if (sceHttpGetResponseContentLength(req, &lengthType, &contentLen) >= 0 && contentLen > 0)
+        job.totalBytes = contentLen;
+    else
+        contentLen = 0;
 
-    std::ofstream out(job.destPath, std::ios::binary);
-    if (!out) { job.errorMsg = "can't open dest"; return false; }
+    const std::string partial = job.destPath + ".part";
+    std::ofstream out(partial, std::ios::binary);
+    if (!out) {
+        sceHttpDeleteRequest(req);
+        sceHttpDeleteConnection(conn);
+        job.errorMsg = "can't open destination";
+        return false;
+    }
 
     char buf[HTTP_BUF];
-    int  read;
+    int read = -1;
     uint64_t prev  = 0;
-    uint64_t t0    = sceKernelGetProcessTimeCounter();
+    uint64_t t0    = sceKernelGetProcessTime();
 
-    while (!job.paused && running_) {
+    while (running_ && publishProgress(job)) {
         read = sceHttpReadData(req, buf, sizeof(buf));
         if (read < 0) { job.errorMsg = "read error"; break; }
         if (read == 0) break;
 
-        out.write(buf, read);
+        if (!out.write(buf, read)) { job.errorMsg = "write error"; break; }
         job.bytesDown += read;
 
-        uint64_t now  = sceKernelGetProcessTimeCounter();
+        uint64_t now  = sceKernelGetProcessTime();
         double   dt   = (double)(now - t0) / 1000000.0;  // us → s
         if (dt > 0.5) {
             job.speedBps = (float)((job.bytesDown - prev) / dt);
@@ -142,8 +175,14 @@ bool Fetcher::httpDownload(DownloadJob& job) {
     sceHttpDeleteRequest(req);
     sceHttpDeleteConnection(conn);
 
-    bool ok = (read == 0 && !job.paused);
-    if (!ok && job.errorMsg.empty()) job.errorMsg = "incomplete";
+    out.close();
+    const bool ok = read == 0 && out && running_ && publishProgress(job) &&
+                    (!contentLen || job.bytesDown == contentLen) &&
+                    rename(partial.c_str(), job.destPath.c_str()) == 0;
+    if (!ok) {
+        remove(partial.c_str());
+        if (job.errorMsg.empty()) job.errorMsg = "incomplete";
+    }
     return ok;
 }
 
@@ -152,75 +191,105 @@ bool Fetcher::httpDownload(DownloadJob& job) {
 // ─────────────────────────────────────────────
 
 void Fetcher::workerLoop() {
-    // Ensure download dirs exist
-    mkdir(DOWNLOAD_DIR, 0755);
-    mkdir(THUMB_DIR,    0755);
-
     while (running_) {
-        DownloadJob* active = nullptr;
+        std::function<void()> request;
+        DownloadJob active;
         {
-            std::lock_guard<std::mutex> lk(qMu_);
-            for (auto& j : queue_) {
-                if (j.state == InstallState::Queued && !j.paused) {
-                    active = &j;
-                    j.state = InstallState::Downloading;
-                    break;
+            std::lock_guard<std::mutex> lock(qMu_);
+            if (!requests_.empty()) {
+                request = std::move(requests_.front());
+                requests_.pop_front();
+            } else {
+                for (auto& job : queue_) {
+                    if (job.state == InstallState::Queued && !job.paused) {
+                        job.bytesDown = 0;
+                        job.errorMsg.clear();
+                        job.state = InstallState::Downloading;
+                        active = job;
+                        break;
+                    }
                 }
             }
         }
 
-        if (!active) { sceKernelUsleep(100000); continue; }
-
-        bool ok = httpDownload(*active);
-
-        std::lock_guard<std::mutex> lk(qMu_);
-        active->state = ok ? InstallState::Done : InstallState::Error;
-        if (!ok) active->speedBps = 0;
+        if (request) {
+            request();
+        } else if (!active.id.empty()) {
+            const bool ok = httpDownload(active);
+            std::lock_guard<std::mutex> lock(qMu_);
+            for (auto& job : queue_) {
+                if (job.id == active.id && job.url == active.url && job.state == InstallState::Downloading) {
+                    job.errorMsg = active.errorMsg;
+                    job.speedBps = 0;
+                    job.state = ok ? InstallState::Done : InstallState::Error;
+                    break;
+                }
+            }
+        } else {
+            sceKernelUsleep(50000);
+        }
     }
 }
 
-// ─────────────────────────────────────────────
-//  Public API
-// ─────────────────────────────────────────────
-
-void Fetcher::setManifestUrl(const std::string& url) { manifestUrl_ = url; }
-
-void Fetcher::fetchManifestAsync(std::function<void(bool)> cb) {
-    std::thread([this, cb]{
-        std::string body;
-        bool ok = httpGet(manifestUrl_, body);
-        if (ok) manifestCache_ = body;
-        cb(ok);
-    }).detach();
+bool Fetcher::publishProgress(const DownloadJob& active) {
+    std::lock_guard<std::mutex> lock(qMu_);
+    for (auto& job : queue_) {
+        if (job.id == active.id && job.url == active.url && job.state == InstallState::Downloading) {
+            job.totalBytes = active.totalBytes;
+            job.bytesDown = active.bytesDown;
+            job.speedBps = active.speedBps;
+            return !job.paused;
+        }
+    }
+    return false;
 }
 
-std::string Fetcher::getManifest() const { return manifestCache_; }
+void Fetcher::fetchManifestAsync(const std::string& url) {
+    if (url.empty()) return;
+    std::lock_guard<std::mutex> lock(qMu_);
+    requests_.push_back([this, url] {
+        std::string body;
+        if (httpGet(url, body)) {
+            std::lock_guard<std::mutex> lock(qMu_);
+            manifestCache_ = std::move(body);
+        }
+    });
+}
 
-void Fetcher::fetchThumbAsync(const std::string& url,
-                              const std::string& cacheKey,
-                              std::function<void(std::string)> onPathReady) {
-    std::string cachePath = std::string(THUMB_DIR) + cacheKey + ".jpg";
-    // Check disk cache first
+std::string Fetcher::takeManifest() {
+    std::lock_guard<std::mutex> lock(qMu_);
+    return std::move(manifestCache_);
+}
+
+std::string Fetcher::thumbnail(const std::string& url, const std::string& cacheKey) {
+    if (url.empty()) return {};
+    std::string path = std::string(THUMB_DIR) + cacheKey + ".jpg";
     struct stat st{};
-    if (stat(cachePath.c_str(), &st) == 0 && st.st_size > 0) {
-        onPathReady(cachePath);
-        return;
-    }
-    std::thread([this, url, cachePath, onPathReady]{
+    if (stat(path.c_str(), &st) == 0 && st.st_size > 0) return path;
+    std::lock_guard<std::mutex> lock(qMu_);
+    if (!thumbnailRequests_.insert(cacheKey).second) return {};
+    requests_.push_back([this, url, path] {
         std::string body;
-        if (!httpGet(url, body)) return;
-        std::ofstream f(cachePath, std::ios::binary);
-        if (!f) return;
-        f.write(body.data(), body.size());
-        onPathReady(cachePath);
-    }).detach();
+        if (!httpGet(url, body) || body.empty()) return;
+        const std::string partial = path + ".part";
+        std::ofstream file(partial, std::ios::binary);
+        file.write(body.data(), body.size());
+        file.close();
+        if (!file || rename(partial.c_str(), path.c_str()) != 0) remove(partial.c_str());
+    });
+    return {};
 }
 
 void Fetcher::enqueue(DownloadJob job) {
     std::lock_guard<std::mutex> lk(qMu_);
     // Avoid duplicate
-    for (auto& j : queue_)
-        if (j.id == job.id && j.url == job.url) return;
+    for (auto& existing : queue_) {
+        if (existing.id == job.id && existing.url == job.url) {
+            if (existing.state == InstallState::Error || existing.state == InstallState::Done)
+                existing = std::move(job);
+            return;
+        }
+    }
     queue_.push_back(std::move(job));
 }
 

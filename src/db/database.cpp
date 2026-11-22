@@ -1,200 +1,122 @@
-// NEBULA HUB — Database implementation
-// Uses a minimal hand-rolled JSON parser (no deps beyond libc)
-// for PS4 compatibility — no Boost, no nlohmann on this platform.
-
 #include "database.h"
-#include <fstream>
-#include <sstream>
+#include "json.hpp"
+
 #include <algorithm>
 #include <cctype>
-#include <cstring>
+#include <cstdio>
 #include <ctime>
-#include <orbis/libkernel.h>
+#include <fstream>
+#include <sstream>
 
-// ─────────────────────────────────────────────
-//  Minimal JSON value extraction helpers
-// ─────────────────────────────────────────────
+using nlohmann::json;
 
-static std::string jsonString(const std::string& src, const std::string& key) {
-    std::string k = "\"" + key + "\":\"";
-    auto pos = src.find(k);
-    if (pos == std::string::npos) return "";
-    pos += k.size();
-    auto end = src.find('"', pos);
-    if (end == std::string::npos) return "";
-    return src.substr(pos, end - pos);
-}
-
-static uint64_t jsonUint(const std::string& src, const std::string& key) {
-    std::string k = "\"" + key + "\":";
-    auto pos = src.find(k);
-    if (pos == std::string::npos) return 0;
-    pos += k.size();
-    while (pos < src.size() && src[pos] == ' ') ++pos;
-    uint64_t v = 0;
-    while (pos < src.size() && std::isdigit((unsigned char)src[pos]))
-        v = v * 10 + (src[pos++] - '0');
-    return v;
-}
-
-static bool jsonBool(const std::string& src, const std::string& key) {
-    std::string k = "\"" + key + "\":";
-    auto pos = src.find(k);
-    if (pos == std::string::npos) return false;
-    pos += k.size();
-    while (pos < src.size() && src[pos] == ' ') ++pos;
-    return src.substr(pos, 4) == "true";
-}
-
-static std::vector<std::string> jsonStringArray(const std::string& src, const std::string& key) {
-    std::vector<std::string> out;
-    std::string k = "\"" + key + "\":[";
-    auto pos = src.find(k);
-    if (pos == std::string::npos) return out;
-    pos += k.size();
-    auto end = src.find(']', pos);
-    if (end == std::string::npos) return out;
-    std::string arr = src.substr(pos, end - pos);
-    size_t p = 0;
-    while ((p = arr.find('"', p)) != std::string::npos) {
-        ++p;
-        auto q = arr.find('"', p);
-        if (q == std::string::npos) break;
-        out.push_back(arr.substr(p, q - p));
-        p = q + 1;
-    }
-    return out;
-}
-
-// Split a JSON array of objects by their opening brace
-static std::vector<std::string> splitObjects(const std::string& src) {
-    std::vector<std::string> objs;
-    int depth = 0;
-    size_t start = std::string::npos;
-    for (size_t i = 0; i < src.size(); ++i) {
-        if (src[i] == '{') {
-            if (depth == 0) start = i;
-            ++depth;
-        } else if (src[i] == '}') {
-            --depth;
-            if (depth == 0 && start != std::string::npos)
-                objs.push_back(src.substr(start, i - start + 1));
-        }
-    }
-    return objs;
-}
-
-// ─────────────────────────────────────────────
-//  Database impl
-// ─────────────────────────────────────────────
-
-Database::Database() {}
+Database::Database() = default;
 
 void Database::load(const std::string& path) {
     dbPath_ = path;
-    std::ifstream f(path);
-    if (!f) return;
-    std::ostringstream ss;
-    ss << f.rdbuf();
-    parseJson(ss.str());
+    std::ifstream file(path);
+    if (!file) return;
+    std::ostringstream text;
+    text << file.rdbuf();
+    parseJson(text.str(), true);
 }
 
 void Database::save(const std::string& path) {
-    std::ofstream f(path);
-    if (f) f << serializeJson();
+    if (path.empty()) return;
+    const std::string partial = path + ".tmp";
+    std::ofstream file(partial);
+    file << serializeJson();
+    file.close();
+    if (!file || rename(partial.c_str(), path.c_str()) != 0) remove(partial.c_str());
 }
 
 void Database::importManifest(const std::string& jsonText) {
-    // Merge new entries, preserve local install state + favorites
-    std::unordered_map<std::string, ContentEntry> existing = entries_;
-    parseJson(jsonText);
-    for (auto& [id, e] : entries_) {
-        if (existing.count(id)) {
-            e.installState  = existing[id].installState;
-            e.favorite      = existing[id].favorite;
-            e.localPath     = existing[id].localPath;
-        }
-    }
-    manifestTimestamp_ = (uint64_t)time(nullptr);
+    if (!parseJson(jsonText, false)) return;
+    manifestTimestamp_ = static_cast<uint64_t>(time(nullptr));
     save(dbPath_);
 }
 
 bool Database::isStale() const {
-    if (manifestTimestamp_ == 0) return true;
-    uint64_t now = (uint64_t)time(nullptr);
-    return (now - manifestTimestamp_) > 86400; // 24 h
+    const auto now = static_cast<uint64_t>(time(nullptr));
+    return manifestTimestamp_ == 0 || now < manifestTimestamp_ ||
+           now - manifestTimestamp_ > 86400;
 }
 
-void Database::parseJson(const std::string& json) {
-    // Find "entries" array
-    auto pos = json.find("\"entries\":[");
-    if (pos == std::string::npos) return;
-    pos += 11;
-    auto end = json.rfind(']');
-    if (end == std::string::npos) return;
-    std::string arr = json.substr(pos, end - pos);
-    auto objs = splitObjects(arr);
-    for (auto& obj : objs) {
-        ContentEntry e;
-        e.id            = jsonString(obj, "id");
-        if (e.id.empty()) continue;
-        e.name          = jsonString(obj, "name");
-        std::string t   = jsonString(obj, "type");
-        e.type          = (t == "theme") ? ContentType::Theme : ContentType::Avatar;
-        e.category      = jsonString(obj, "category");
-        e.subcategory   = jsonString(obj, "subcategory");
-        e.animated      = jsonBool(obj, "animated");
-        e.previewUrl    = jsonString(obj, "preview_url");
-        e.downloadUrl   = jsonString(obj, "download_url");
-        e.pkgStubUrl    = jsonString(obj, "pkg_stub_url");
-        e.pkgPayloadUrl = jsonString(obj, "pkg_payload_url");
-        e.fileSize      = jsonUint(obj, "file_size");
-        e.stubSize      = jsonUint(obj, "stub_size");
-        e.payloadSize   = jsonUint(obj, "payload_size");
-        e.fileFormat    = jsonString(obj, "file_format");
-        e.source        = jsonString(obj, "source");
-        e.installMethod = jsonString(obj, "install_method");
-        e.tags          = jsonStringArray(obj, "tags");
-        entries_[e.id]  = e;
+bool Database::parseJson(const std::string& text, bool local) {
+    const auto document = json::parse(text, nullptr, false);
+    if (!document.is_object() || !document.contains("entries") ||
+        !document["entries"].is_array()) return false;
+
+    std::vector<ContentEntry> parsed;
+    try {
+        for (const auto& item : document["entries"]) {
+            ContentEntry entry;
+            entry.id = item.value("id", "");
+            if (entry.id.empty() || entry.id.find_first_not_of(
+                "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-") != std::string::npos) continue;
+            entry.name = item.value("name", "");
+            entry.type = item.value("type", "") == "theme" ? ContentType::Theme : ContentType::Avatar;
+            entry.category = item.value("category", "");
+            entry.subcategory = item.value("subcategory", "");
+            entry.animated = item.value("animated", false);
+            entry.previewUrl = item.value("preview_url", "");
+            entry.downloadUrl = item.value("download_url", "");
+            entry.pkgStubUrl = item.value("pkg_stub_url", "");
+            entry.pkgPayloadUrl = item.value("pkg_payload_url", "");
+            entry.fileSize = item.value<uint64_t>("file_size", 0);
+            entry.stubSize = item.value<uint64_t>("stub_size", 0);
+            entry.payloadSize = item.value<uint64_t>("payload_size", 0);
+            entry.fileFormat = item.value("file_format", "");
+            entry.source = item.value("source", "");
+            entry.installMethod = item.value("install_method", "");
+            entry.tags = item.value("tags", std::vector<std::string>{});
+            if (local) {
+                const auto state = item.value("install_state", 0);
+                if (state == static_cast<int>(InstallState::Done))
+                    entry.installState = InstallState::Done;
+                entry.favorite = item.value("favorite", false);
+                entry.localPath = item.value("local_path", "");
+                entry.localStubPath = item.value("local_stub_path", "");
+                entry.localPayloadPath = item.value("local_payload_path", "");
+            } else if (const auto* saved = byId(entry.id)) {
+                entry.installState = saved->installState;
+                entry.favorite = saved->favorite;
+                entry.localPath = saved->localPath;
+                entry.localStubPath = saved->localStubPath;
+                entry.localPayloadPath = saved->localPayloadPath;
+            }
+            parsed.push_back(std::move(entry));
+        }
+        if (local) manifestTimestamp_ = document.value<uint64_t>("timestamp", 0);
+    } catch (const json::exception&) {
+        return false;
     }
+    for (auto& entry : parsed) {
+        const auto id = entry.id;
+        entries_[id] = std::move(entry);
+    }
+    return !parsed.empty();
 }
 
 std::string Database::serializeJson() const {
-    // Write compact JSON for persistence
-    std::ostringstream o;
-    o << "{\"timestamp\":" << manifestTimestamp_ << ",\"entries\":[\n";
-    bool first = true;
-    for (auto& [id, e] : entries_) {
-        if (!first) o << ",\n";
-        first = false;
-        o << "{\"id\":\"" << e.id << "\","
-          << "\"name\":\"" << e.name << "\","
-          << "\"type\":\"" << (e.type==ContentType::Theme?"theme":"avatar") << "\","
-          << "\"category\":\"" << e.category << "\","
-          << "\"subcategory\":\"" << e.subcategory << "\","
-          << "\"animated\":" << (e.animated?"true":"false") << ","
-          << "\"preview_url\":\"" << e.previewUrl << "\","
-          << "\"download_url\":\"" << e.downloadUrl << "\","
-          << "\"pkg_stub_url\":\"" << e.pkgStubUrl << "\","
-          << "\"pkg_payload_url\":\"" << e.pkgPayloadUrl << "\","
-          << "\"file_size\":" << e.fileSize << ","
-          << "\"stub_size\":" << e.stubSize << ","
-          << "\"payload_size\":" << e.payloadSize << ","
-          << "\"file_format\":\"" << e.fileFormat << "\","
-          << "\"source\":\"" << e.source << "\","
-          << "\"install_method\":\"" << e.installMethod << "\","
-          << "\"install_state\":" << (int)e.installState << ","
-          << "\"favorite\":" << (e.favorite?"true":"false") << ","
-          << "\"local_path\":\"" << e.localPath << "\","
-          << "\"tags\":[";
-        for (size_t i = 0; i < e.tags.size(); ++i) {
-            if (i) o << ",";
-            o << "\"" << e.tags[i] << "\"";
-        }
-        o << "]}";
+    auto items = json::array();
+    for (const auto& [id, entry] : entries_) {
+        items.push_back({
+            {"id", id}, {"name", entry.name},
+            {"type", entry.type == ContentType::Theme ? "theme" : "avatar"},
+            {"category", entry.category}, {"subcategory", entry.subcategory},
+            {"animated", entry.animated}, {"preview_url", entry.previewUrl},
+            {"download_url", entry.downloadUrl}, {"pkg_stub_url", entry.pkgStubUrl},
+            {"pkg_payload_url", entry.pkgPayloadUrl}, {"file_size", entry.fileSize},
+            {"stub_size", entry.stubSize}, {"payload_size", entry.payloadSize},
+            {"file_format", entry.fileFormat}, {"source", entry.source},
+            {"install_method", entry.installMethod}, {"tags", entry.tags},
+            {"install_state", static_cast<int>(entry.installState)}, {"favorite", entry.favorite},
+            {"local_path", entry.localPath}, {"local_stub_path", entry.localStubPath},
+            {"local_payload_path", entry.localPayloadPath}
+        });
     }
-    o << "\n]}";
-    return o.str();
+    return json{{"timestamp", manifestTimestamp_}, {"entries", items}}.dump();
 }
 
 // ─── Helpers ───

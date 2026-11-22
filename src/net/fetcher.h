@@ -1,11 +1,15 @@
 #pragma once
 #include "../nebula.h"
 #include <string>
+#include <cstdint>
+#include <cstdio>
 #include <functional>
 #include <vector>
 #include <atomic>
 #include <thread>
 #include <mutex>
+#include <deque>
+#include <unordered_set>
 
 // ─────────────────────────────────────────────
 //  Download job
@@ -37,7 +41,7 @@ struct DownloadJob {
 
     std::string etaStr() const {
         if (speedBps <= 0 || totalBytes == 0) return "--:--";
-        uint64_t rem  = totalBytes - bytesDown;
+        uint64_t rem = totalBytes > bytesDown ? totalBytes - bytesDown : 0;
         uint64_t secs = (uint64_t)(rem / speedBps);
         char buf[16];
         snprintf(buf, sizeof(buf), "%02llu:%02llu",
@@ -56,17 +60,9 @@ public:
     Fetcher();
     ~Fetcher();
 
-    void setManifestUrl(const std::string& url);
-
-    // Async manifest fetch
-    void fetchManifestAsync(std::function<void(bool)> cb);
-    std::string getManifest() const;
-
-    // Thumbnail fetch (cached to disk)
-    // Returns SDL_Surface* as void* to avoid SDL include here
-    void fetchThumbAsync(const std::string& url,
-                         const std::string& cacheKey,
-                         std::function<void(std::string)> onPathReady);
+    void fetchManifestAsync(const std::string& url);
+    std::string takeManifest();
+    std::string thumbnail(const std::string& url, const std::string& cacheKey);
 
     // Download queue
     void enqueue(DownloadJob job);
@@ -81,7 +77,8 @@ public:
     int     activeCount()   const;
 
 private:
-    std::string  manifestUrl_;
+    std::deque<std::function<void()>> requests_;
+    std::unordered_set<std::string> thumbnailRequests_;
     std::string  manifestCache_;
 
     std::vector<DownloadJob> queue_;
@@ -90,12 +87,16 @@ private:
     std::atomic<bool>        running_{true};
 
     void workerLoop();
+    bool publishProgress(const DownloadJob& active);
     bool httpGet(const std::string& url, std::string& body, std::string* errOut = nullptr);
     bool httpDownload(DownloadJob& job);
 
     // PS4 native HTTP helpers
-    int netHandle_ = -1;
-    int httpCtx_   = -1;
+    bool netInitialized_ = false;
+    int netPool_ = -1;
+    int sslCtx_ = -1;
+    int httpCtx_ = -1;
+    int httpTemplate_ = -1;
     void initNet();
     void freeNet();
 };
