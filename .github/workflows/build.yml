@@ -101,6 +101,7 @@ jobs:
           CXXFLAGS="-target x86_64-pc-freebsd12-elf -fPIC -funwind-tables \
                     -std=c++17 -O2 -D__ORBIS__ \
                     -nostdinc++ -isystem $LIBCXX_INCLUDE \
+                    -include include/ps4_cpp_compat.h \
                     -I$OO/include \
                     -Iinclude \
                     -Isrc"
