@@ -26,6 +26,7 @@ jobs:
           wget -O openorbis.tar.gz https://github.com/OpenOrbis/OpenOrbis-PS4-Toolchain/releases/download/v0.5.4/toolchain-llvm-18.tar.gz
           mkdir -p openorbis
           tar -xzf openorbis.tar.gz -C openorbis
+          mv openorbis/OpenOrbis/* openorbis/
           echo "Estrutura do pacote OpenOrbis:"
           ls -la openorbis
           ls -la openorbis/bin 2>/dev/null || true
