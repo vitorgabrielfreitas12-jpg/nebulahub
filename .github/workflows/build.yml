@@ -74,7 +74,7 @@ jobs:
       - name: Compile NEBULA HUB ELF
         run: |
           OO="${{ env.OO_PS4_TOOLCHAIN }}"
-          CLANG="$OO/bin/linux/clang++" ; [ -f "$CLANG" ] || CLANG="clang++"
+          CLANG="$OO/bin/linux/clang++" ; [ -x "$CLANG" ] || { echo "ERRO: compilador OpenOrbis não encontrado ou não executável"; exit 1; }
           LLD="$OO/bin/linux/ld.lld"   ; [ -f "$LLD"   ] || LLD="ld.lld"
 
           # Use our bundled SDL2 stub headers from include/SDL2/
