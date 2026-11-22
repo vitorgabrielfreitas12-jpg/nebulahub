@@ -31,8 +31,8 @@ int main() {
     sceUserServiceInitialize(nullptr);
     scePadInit();
 
-    OrbisUserServiceInitialUser userId;
-    sceUserServiceGetInitialUser(&userId);
+    OrbisUserServiceUserId userId = 0;
+    if (sceUserServiceGetInitialUser(&userId) < 0) return 1;
 
     // SDL init
     SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO);
