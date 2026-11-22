@@ -17,8 +17,8 @@ TTF_Font* Renderer::getFont(int size, bool bold) {
     auto it = fonts_.find(key);
     if (it != fonts_.end()) return it->second;
     const char* path = bold
-        ? "assets/fonts/NotoSans-Bold.ttf"
-        : "assets/fonts/NotoSans-Regular.ttf";
+        ? FONT_BOLD
+        : FONT_REGULAR;
     TTF_Font* f = TTF_OpenFont(path, size);
     if (!f) {
         // Fallback: try next size or return nullptr
@@ -179,7 +179,7 @@ void Renderer::drawTexture(SDL_Texture* tex, int x, int y, int w, int h, float a
 }
 
 void Renderer::drawTextureRounded(SDL_Texture* tex, int x, int y, int w, int h,
-                                   int radius, float alpha) {
+                                   int /*radius*/, float alpha) {
     // Simple: just draw the texture, rounded corners are hard without stencils
     // For PS4 SDL2 this is the pragmatic path
     drawTexture(tex, x, y, w, h, alpha);

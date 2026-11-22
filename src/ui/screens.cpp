@@ -4,7 +4,7 @@
 #include <cmath>
 #include <cstdio>
 #include <algorithm>
-#include <orbis/SystemService.h>
+#include <sys/stat.h>
 
 // ─────────────────────────────────────────────
 //  ScreenManager
@@ -69,21 +69,21 @@ HomeScreen::HomeScreen() {
 
 void HomeScreen::update(ScreenCtx& ctx) {
     bgPulse_ += 0.015f;
-    if (ctx.ctrl.pressed(PAD_BUTTON_DPAD_RIGHT)) {
+    if (ctx.ctrl.pressed(ORBIS_PAD_BUTTON_RIGHT)) {
         selectedIdx_ = (selectedIdx_ + 1) % (int)tiles_.size();
     }
-    if (ctx.ctrl.pressed(PAD_BUTTON_DPAD_LEFT)) {
+    if (ctx.ctrl.pressed(ORBIS_PAD_BUTTON_LEFT)) {
         selectedIdx_ = ((selectedIdx_ - 1) + (int)tiles_.size()) % (int)tiles_.size();
     }
-    if (ctx.ctrl.pressed(PAD_BUTTON_DPAD_DOWN)) {
+    if (ctx.ctrl.pressed(ORBIS_PAD_BUTTON_DOWN)) {
         int next = selectedIdx_ + 3;
         if (next < (int)tiles_.size()) selectedIdx_ = next;
     }
-    if (ctx.ctrl.pressed(PAD_BUTTON_DPAD_UP)) {
+    if (ctx.ctrl.pressed(ORBIS_PAD_BUTTON_UP)) {
         int prev = selectedIdx_ - 3;
         if (prev >= 0) selectedIdx_ = prev;
     }
-    if (ctx.ctrl.pressed(PAD_BUTTON_CROSS)) {
+    if (ctx.ctrl.pressed(ORBIS_PAD_BUTTON_CROSS)) {
         ctx.navigate(tiles_[selectedIdx_].target, nullptr);
     }
 }
@@ -182,16 +182,6 @@ void LibraryScreen::refreshEntries(ScreenCtx& ctx) {
         entries_ = ctx.db.byCategory(type_, selCategory_);
 }
 
-void LibraryScreen::loadThumb(ScreenCtx& ctx, ContentEntry* e) {
-    if (thumbs_.count(e->id)) return;
-    if (e->previewUrl.empty()) return;
-    std::string cacheKey = e->id;
-    ctx.net.fetchThumbAsync(e->previewUrl, cacheKey, [this, e](std::string path) {
-        // Will be loaded on next render
-        e->localPath = path; // reuse local path as thumb indicator
-    });
-}
-
 void LibraryScreen::drawCard(ScreenCtx& ctx, ContentEntry* e, int x, int y, bool focused) {
     auto& gfx = ctx.gfx;
     int cw = 280, ch = 320;
@@ -206,8 +196,9 @@ void LibraryScreen::drawCard(ScreenCtx& ctx, ContentEntry* e, int x, int y, bool
     SDL_Texture* thumb = nullptr;
     auto it = thumbs_.find(e->id);
     if (it != thumbs_.end()) thumb = it->second;
-    if (!thumb && !e->localPath.empty()) {
-        thumb = gfx.loadTexture(e->localPath);
+    if (!thumb) {
+        const auto path = ctx.net.thumbnail(e->previewUrl, e->id);
+        if (!path.empty()) thumb = gfx.loadTexture(path);
         if (thumb) thumbs_[e->id] = thumb;
     }
 
@@ -266,16 +257,19 @@ void LibraryScreen::drawCard(ScreenCtx& ctx, ContentEntry* e, int x, int y, bool
 void LibraryScreen::update(ScreenCtx& ctx) {
     if (entries_.empty()) refreshEntries(ctx);
 
+    if (ctx.ctrl.pressed(ORBIS_PAD_BUTTON_SQUARE)) ctx.navigate(ScreenID::Search, nullptr);
+    if (entries_.empty()) return;
+
     int cols = 5;
     int rows = ((int)entries_.size() + cols - 1) / cols;
 
-    if (ctx.ctrl.pressed(PAD_BUTTON_DPAD_RIGHT)) {
+    if (ctx.ctrl.pressed(ORBIS_PAD_BUTTON_RIGHT)) {
         int next = colIdx_ + 1;
-        if (rowIdx_ * cols + next < (int)entries_.size()) colIdx_ = next;
+        if (next < cols && rowIdx_ * cols + next < (int)entries_.size()) colIdx_ = next;
     }
-    if (ctx.ctrl.pressed(PAD_BUTTON_DPAD_LEFT) && colIdx_ > 0) colIdx_--;
-    if (ctx.ctrl.pressed(PAD_BUTTON_DPAD_DOWN) && rowIdx_ < rows - 1) rowIdx_++;
-    if (ctx.ctrl.pressed(PAD_BUTTON_DPAD_UP)   && rowIdx_ > 0) rowIdx_--;
+    if (ctx.ctrl.pressed(ORBIS_PAD_BUTTON_LEFT) && colIdx_ > 0) colIdx_--;
+    if (ctx.ctrl.pressed(ORBIS_PAD_BUTTON_DOWN) && rowIdx_ < rows - 1) rowIdx_++;
+    if (ctx.ctrl.pressed(ORBIS_PAD_BUTTON_UP)   && rowIdx_ > 0) rowIdx_--;
 
     // Clamp colIdx for last (possibly shorter) row
     int maxCol = std::min(cols - 1, (int)entries_.size() - rowIdx_ * cols - 1);
@@ -287,16 +281,9 @@ void LibraryScreen::update(ScreenCtx& ctx) {
     scrollX_ += (targetX - scrollX_) * 0.18f;
     scrollY_ += (targetY - scrollY_) * 0.18f;
 
-    int selIdx = rowIdx_ * cols + colIdx_;
-    if (selIdx < (int)entries_.size()) {
-        loadThumb(ctx, entries_[selIdx]);
-    }
-
-    if (ctx.ctrl.pressed(PAD_BUTTON_TRIANGLE)) {
-        int idx = rowIdx_ * cols + colIdx_;
-        if (idx < (int)entries_.size())
-            ctx.db.toggleFavorite(entries_[idx]->id);
-    }
+    auto* entry = entries_[rowIdx_ * cols + colIdx_];
+    if (ctx.ctrl.pressed(ORBIS_PAD_BUTTON_TRIANGLE)) ctx.db.toggleFavorite(entry->id);
+    if (ctx.ctrl.pressed(ORBIS_PAD_BUTTON_CROSS)) ctx.navigate(ScreenID::ItemPreview, entry);
 }
 
 void LibraryScreen::render(ScreenCtx& ctx) {
@@ -381,13 +368,28 @@ void SearchScreen::doSearch(ScreenCtx& ctx) {
 }
 
 void SearchScreen::update(ScreenCtx& ctx) {
-    if (ctx.ctrl.pressed(PAD_BUTTON_DPAD_DOWN) && selIdx_ < (int)results_.size()-1) selIdx_++;
-    if (ctx.ctrl.pressed(PAD_BUTTON_DPAD_UP)   && selIdx_ > 0) selIdx_--;
-    if (ctx.ctrl.pressed(PAD_BUTTON_L1)) {
+    static const std::string alphabet = "abcdefghijklmnopqrstuvwxyz0123456789 ";
+    if (ctx.ctrl.pressed(ORBIS_PAD_BUTTON_LEFT))
+        searchChar_ = (searchChar_ + alphabet.size() - 1) % alphabet.size();
+    if (ctx.ctrl.pressed(ORBIS_PAD_BUTTON_RIGHT))
+        searchChar_ = (searchChar_ + 1) % alphabet.size();
+    if (ctx.ctrl.pressed(ORBIS_PAD_BUTTON_SQUARE) && query_.size() < 100) {
+        query_ += alphabet[searchChar_];
+        doSearch(ctx);
+    }
+    if (ctx.ctrl.pressed(ORBIS_PAD_BUTTON_TRIANGLE) && !query_.empty()) {
+        query_.pop_back();
+        doSearch(ctx);
+    }
+    if (!results_.empty() && ctx.ctrl.pressed(ORBIS_PAD_BUTTON_CROSS))
+        ctx.navigate(ScreenID::ItemPreview, results_[selIdx_]);
+    if (ctx.ctrl.pressed(ORBIS_PAD_BUTTON_DOWN) && selIdx_ < (int)results_.size()-1) selIdx_++;
+    if (ctx.ctrl.pressed(ORBIS_PAD_BUTTON_UP)   && selIdx_ > 0) selIdx_--;
+    if (ctx.ctrl.pressed(ORBIS_PAD_BUTTON_L1)) {
         filterMode_ = (filterMode_ + 3) % 4;
         doSearch(ctx);
     }
-    if (ctx.ctrl.pressed(PAD_BUTTON_R1)) {
+    if (ctx.ctrl.pressed(ORBIS_PAD_BUTTON_R1)) {
         filterMode_ = (filterMode_ + 1) % 4;
         doSearch(ctx);
     }
@@ -423,6 +425,11 @@ void SearchScreen::render(ScreenCtx& ctx) {
     std::string display = query_.empty() ? "Search avatars & themes..." : query_ + "|";
     Color tc = query_.empty() ? fromHex(COL_SUBTEXT) : fromHex(COL_TEXT);
     gfx.text(display, 90, 128, tc, 22);
+    static const std::string alphabet = "abcdefghijklmnopqrstuvwxyz0123456789 ";
+    const char letter = alphabet[searchChar_];
+    const auto selected = letter == ' ' ? std::string("space") : std::string(1, letter);
+    gfx.text("← → Choose [" + selected + "]    □ Add    △ Delete    ✕ Open result",
+             900, 128, fromHex(COL_SUBTEXT), 20);
 
     // Filter tabs
     static const char* ftabs[] = {"ALL", "AVATARS", "THEMES", "ANIMATED"};
@@ -439,7 +446,7 @@ void SearchScreen::render(ScreenCtx& ctx) {
     int ry = 230;
     gfx.text("Results:", 60, ry, fromHex(COL_SUBTEXT), 18);
     if (query_.empty()) {
-        gfx.textCentered("Press □ / use keyboard to search",
+        gfx.textCentered("Choose a character and press □ to search",
                          0, 300, SCREEN_W, 400, fromHex(COL_SUBTEXT), 24);
         return;
     }
@@ -476,19 +483,56 @@ void SearchScreen::render(ScreenCtx& ctx) {
 PreviewScreen::PreviewScreen(ContentEntry* entry) : entry_(entry) {}
 
 void PreviewScreen::update(ScreenCtx& ctx) {
-    pulse_ += 0.04f;
+    if (ctx.ctrl.pressed(ORBIS_PAD_BUTTON_RIGHT)) btnIdx_ = (btnIdx_ + 1) % 3;
+    if (ctx.ctrl.pressed(ORBIS_PAD_BUTTON_LEFT))  btnIdx_ = (btnIdx_ - 1 + 3) % 3;
 
-    if (ctx.ctrl.pressed(PAD_BUTTON_DPAD_RIGHT)) btnIdx_ = (btnIdx_ + 1) % 3;
-    if (ctx.ctrl.pressed(PAD_BUTTON_DPAD_LEFT))  btnIdx_ = (btnIdx_ - 1 + 3) % 3;
-
-    if (ctx.ctrl.pressed(PAD_BUTTON_CROSS) && !downloading_) {
+    if (downloading_) {
+        const auto jobs = ctx.net.queueSnapshot();
+        downloading_ = std::any_of(jobs.begin(), jobs.end(), [this](const DownloadJob& job) {
+            const bool matches = job.id == entry_->id || job.id == entry_->id + "_stub" ||
+                                 job.id == entry_->id + "_payload";
+            return matches && (job.state == InstallState::Queued || job.state == InstallState::Downloading);
+        });
+        if (!downloading_) statusMsg_ = "Press Cross to install or retry the download.";
+    }
+    if (ctx.ctrl.pressed(ORBIS_PAD_BUTTON_CROSS) && !downloading_) {
         if (btnIdx_ == 0) {
-            // Download + install
+            const auto exists = [](const std::string& path) {
+                struct stat info{};
+                return !path.empty() && stat(path.c_str(), &info) == 0 && info.st_size > 0;
+            };
+            const auto result = [this](bool ok, const std::string& message) {
+                statusMsg_ = ok ? "Installation request accepted" : message;
+                if (ok && entry_->type == ContentType::Avatar && entry_->fileFormat != "xavatar_fpkg")
+                    statusMsg_ = "Avatar copied. Apply it in Avatar Changer.";
+            };
+            const std::string base = std::string(DOWNLOAD_DIR) + entry_->id;
+            const std::string avatarPath = base + (entry_->fileFormat == "xavatar_fpkg" ? ".pkg" : ".xavatar");
+            const std::string stubPath = base + "_1.pkg";
+            const std::string payloadPath = base + "_2.pkg";
+            if (entry_->type == ContentType::Avatar && exists(avatarPath)) {
+                entry_->localPath = avatarPath;
+                ctx.installer.installAvatar(*entry_, result);
+                return;
+            }
+            if (entry_->type == ContentType::Theme && exists(stubPath) && exists(payloadPath)) {
+                entry_->localStubPath = stubPath;
+                entry_->localPayloadPath = payloadPath;
+                ctx.installer.installTheme(*entry_, result);
+                return;
+            }
+            const bool available = entry_->type == ContentType::Avatar
+                ? !entry_->downloadUrl.empty()
+                : !entry_->pkgStubUrl.empty() && !entry_->pkgPayloadUrl.empty();
+            if (!available) {
+                statusMsg_ = "Download unavailable in this catalog.";
+                return;
+            }
             if (entry_->type == ContentType::Avatar) {
                 DownloadJob job;
                 job.id      = entry_->id;
                 job.url     = entry_->downloadUrl;
-                job.destPath= std::string(DOWNLOAD_DIR) + entry_->id + ".pkg";
+                job.destPath = avatarPath;
                 job.totalBytes = entry_->fileSize;
                 job.state   = InstallState::Queued;
                 ctx.net.enqueue(job);
@@ -500,14 +544,16 @@ void PreviewScreen::update(ScreenCtx& ctx) {
                 DownloadJob j1, j2;
                 j1.id      = entry_->id + "_stub";
                 j1.url     = entry_->pkgStubUrl;
-                j1.destPath= std::string(DOWNLOAD_DIR) + entry_->id + "_1.pkg";
+                j1.destPath = stubPath;
                 j1.totalBytes = entry_->stubSize;
                 j2.id      = entry_->id + "_payload";
                 j2.url     = entry_->pkgPayloadUrl;
-                j2.destPath= std::string(DOWNLOAD_DIR) + entry_->id + "_2.pkg";
+                j2.destPath = payloadPath;
                 j2.totalBytes = entry_->payloadSize;
-                ctx.net.enqueue(j1);
-                ctx.net.enqueue(j2);
+                if (!exists(stubPath)) ctx.net.enqueue(j1);
+                if (!exists(payloadPath)) ctx.net.enqueue(j2);
+                entry_->localStubPath = j1.destPath;
+                entry_->localPayloadPath = j2.destPath;
                 ctx.db.setInstallState(entry_->id, InstallState::Queued);
                 statusMsg_ = "Theme queued — both parts downloading";
                 downloading_ = true;
@@ -531,14 +577,8 @@ void PreviewScreen::render(ScreenCtx& ctx) {
     gfx.fillRoundRect(artX - 8, artY - 8, artW + 16, artH + 16, 16,
                       fromHex(0x1A1A2EFF));
 
-    if (!thumbLoaded_ && !entry_->previewUrl.empty()) {
-        ctx.net.fetchThumbAsync(entry_->previewUrl, entry_->id, [this](std::string path){
-            thumbLoaded_ = true;
-            entry_->localPath = path;
-        });
-    }
-    SDL_Texture* t = nullptr;
-    if (!entry_->localPath.empty()) t = gfx.loadTexture(entry_->localPath);
+    const auto path = ctx.net.thumbnail(entry_->previewUrl, entry_->id);
+    SDL_Texture* t = path.empty() ? nullptr : gfx.loadTexture(path);
     if (t) {
         gfx.drawTexture(t, artX, artY, artW, artH);
     } else {
@@ -629,7 +669,6 @@ void PreviewScreen::render(ScreenCtx& ctx) {
         if (!sel) bc.a = 100;
         gfx.fillRoundRect(bx, by, bw, bh, 10, bc, sel ? 1.0f : 0.4f);
         if (sel) {
-            float glow = 0.5f + 0.5f * std::sin(pulse_);
             gfx.drawRect(bx - 2, by - 2, bw + 4, bh + 4, bc, 2);
         }
         gfx.textCentered(btnLabels[i], bx, by, bw, bh, fromHex(COL_HIGHLIGHT), 20, true);
@@ -657,16 +696,16 @@ void PreviewScreen::render(ScreenCtx& ctx) {
 
 void DownloadsScreen::update(ScreenCtx& ctx) {
     auto jobs = ctx.net.queueSnapshot();
-    if (ctx.ctrl.pressed(PAD_BUTTON_DPAD_DOWN) && selIdx_ < (int)jobs.size()-1) selIdx_++;
-    if (ctx.ctrl.pressed(PAD_BUTTON_DPAD_UP)   && selIdx_ > 0) selIdx_--;
+    if (ctx.ctrl.pressed(ORBIS_PAD_BUTTON_DOWN) && selIdx_ < (int)jobs.size()-1) selIdx_++;
+    if (ctx.ctrl.pressed(ORBIS_PAD_BUTTON_UP)   && selIdx_ > 0) selIdx_--;
     if (!jobs.empty() && selIdx_ < (int)jobs.size()) {
         auto& j = jobs[selIdx_];
-        if (ctx.ctrl.pressed(PAD_BUTTON_SQUARE)) {
+        if (ctx.ctrl.pressed(ORBIS_PAD_BUTTON_SQUARE)) {
             if (j.paused) ctx.net.resume(j.id);
             else          ctx.net.pause(j.id);
         }
-        if (ctx.ctrl.pressed(PAD_BUTTON_TRIANGLE)) ctx.net.cancel(j.id);
-        if (ctx.ctrl.pressed(PAD_BUTTON_CROSS) && j.state == InstallState::Error)
+        if (ctx.ctrl.pressed(ORBIS_PAD_BUTTON_TRIANGLE)) ctx.net.cancel(j.id);
+        if (ctx.ctrl.pressed(ORBIS_PAD_BUTTON_CROSS) && j.state == InstallState::Error)
             ctx.net.retry(j.id);
     }
 }
@@ -731,8 +770,11 @@ void DownloadsScreen::render(ScreenCtx& ctx) {
 
 void FavoritesScreen::update(ScreenCtx& ctx) {
     favs_ = ctx.db.favorites();
-    if (ctx.ctrl.pressed(PAD_BUTTON_DPAD_DOWN) && selIdx_ < (int)favs_.size()-1) selIdx_++;
-    if (ctx.ctrl.pressed(PAD_BUTTON_DPAD_UP)   && selIdx_ > 0) selIdx_--;
+    if (ctx.ctrl.pressed(ORBIS_PAD_BUTTON_DOWN) && selIdx_ < (int)favs_.size()-1) selIdx_++;
+    if (ctx.ctrl.pressed(ORBIS_PAD_BUTTON_UP)   && selIdx_ > 0) selIdx_--;
+    if (selIdx_ >= (int)favs_.size()) selIdx_ = std::max(0, (int)favs_.size() - 1);
+    if (!favs_.empty() && ctx.ctrl.pressed(ORBIS_PAD_BUTTON_CROSS))
+        ctx.navigate(ScreenID::ItemPreview, favs_[selIdx_]);
 }
 
 void FavoritesScreen::render(ScreenCtx& ctx) {
@@ -767,16 +809,14 @@ void FavoritesScreen::render(ScreenCtx& ctx) {
 void SettingsScreen::update(ScreenCtx& ctx) {
     if (settings_.empty()) {
         settings_ = {
-            {"Manifest URL",    MANIFEST_URL},
-            {"CDN Base",        CDN_BASE},
+            {"Manifest URL",    *MANIFEST_URL ? MANIFEST_URL : "Bundled catalog"},
             {"Download Dir",    DOWNLOAD_DIR},
             {"Cache Dir",       CACHE_DIR},
             {"App Version",     APP_VERSION},
-            {"Clear Cache",     "Press ✕ to clear"},
         };
     }
-    if (ctx.ctrl.pressed(PAD_BUTTON_DPAD_DOWN) && selIdx_ < (int)settings_.size()-1) selIdx_++;
-    if (ctx.ctrl.pressed(PAD_BUTTON_DPAD_UP)   && selIdx_ > 0) selIdx_--;
+    if (ctx.ctrl.pressed(ORBIS_PAD_BUTTON_DOWN) && selIdx_ < (int)settings_.size()-1) selIdx_++;
+    if (ctx.ctrl.pressed(ORBIS_PAD_BUTTON_UP)   && selIdx_ > 0) selIdx_--;
 }
 
 void SettingsScreen::render(ScreenCtx& ctx) {

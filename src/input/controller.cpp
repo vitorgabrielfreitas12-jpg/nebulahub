@@ -1,6 +1,4 @@
 #include "controller.h"
-#include <cstring>
-#include <cmath>
 #include <orbis/libkernel.h>
 
 Controller::Controller(OrbisUserServiceUserId userId) {
@@ -13,7 +11,7 @@ Controller::~Controller() {
 
 void Controller::poll() {
     prev_ = cur_;
-    scePadReadState(padHandle_, &cur_);
+    if (padHandle_ < 0 || scePadReadState(padHandle_, &cur_) < 0) cur_ = {};
 }
 
 bool Controller::pressed(uint32_t btn) const {

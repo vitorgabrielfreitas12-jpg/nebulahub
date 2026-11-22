@@ -1,6 +1,7 @@
 #pragma once
 #include "../nebula.h"
 #include <string>
+#include <cstdint>
 #include <vector>
 #include <unordered_map>
 #include <functional>
@@ -73,7 +74,7 @@ private:
     std::string  dbPath_;
     uint64_t     manifestTimestamp_ = 0;
 
-    void parseJson(const std::string& json);
+    bool parseJson(const std::string& json, bool local);
     std::string  serializeJson() const;
 
     // Simple lowercase helper for search

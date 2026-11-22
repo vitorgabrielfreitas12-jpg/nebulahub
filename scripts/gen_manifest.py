@@ -12,7 +12,6 @@ import urllib.request
 import urllib.parse
 import json
 import re
-import sys
 import argparse
 import time
 import os
@@ -79,7 +78,8 @@ def parse_theme_listing(html):
     # Find all .pkg files in the listing
     files = re.findall(r'href="([^"]+\.pkg)"', html)
     # Decode URL-encoded names
-    files = [urllib.parse.unquote(f) for f in files]
+    files = [urllib.parse.unquote(f) for f in files
+             if not urllib.parse.urlsplit(f).netloc and "/" not in f]
     return files
 
 def build_theme_pairs(files):
@@ -124,7 +124,7 @@ def generate_theme_entries(pairs, base_url):
             "pkg_stub_url":     stub_url,
             "pkg_payload_url":  payload_url,
             "file_size":        0,
-            "stub_size":        131072,
+            "stub_size":        0,
             "payload_size":     0,
             "file_format":      "pkg_split",
             "source":           "ps4-permanent-themes-repository / archive.org",
@@ -203,10 +203,10 @@ def build_avatar_entries():
             "subcategory": "mixed_games",
             "animated": False,
             "preview_url": "",
-            "download_url": f"{AVATARS_ARCHIVE}Extra%20Avatars%20-%20Games.pkg",
+            "download_url": "",
             "pkg_stub_url": "",
             "pkg_payload_url": "",
-            "file_size": 198254592,
+            "file_size": 0,
             "stub_size": 0,
             "payload_size": 0,
             "file_format": "xavatar_fpkg",
@@ -256,7 +256,7 @@ def main():
         "entries":       all_entries
     }
 
-    os.makedirs(os.path.dirname(args.output), exist_ok=True)
+    os.makedirs(os.path.dirname(args.output) or ".", exist_ok=True)
     with open(args.output, "w", encoding="utf-8") as f:
         json.dump(manifest, f, indent=2, ensure_ascii=False)
 

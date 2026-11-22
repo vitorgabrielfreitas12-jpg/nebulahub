@@ -2,198 +2,36 @@ name: Build NEBULA HUB PKG
 
 on:
   push:
-    branches: [ main ]
+    branches: [main]
+  pull_request:
   workflow_dispatch:
+
+permissions:
+  contents: read
 
 jobs:
   build:
-    runs-on: ubuntu-22.04
-
+    runs-on: ubuntu-24.04
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Install system dependencies
+      - uses: actions/checkout@v4
+      - name: Install build dependencies
         run: |
-          sudo apt-get update -y
-          sudo apt-get install -y \
-            clang lld llvm libc++-dev libc++abi-dev \
-            python3 wget curl unzip git cmake make imagemagick \
-            dotnet-sdk-8.0
-
-      - name: Get OpenOrbis PS4 Toolchain
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            clang-18 lld-18 binutils make curl ca-certificates imagemagick fonts-dejavu-core dotnet-sdk-8.0
+      - name: Download and verify OpenOrbis and SDL_ttf
+        run: bash scripts/bootstrap-sdk.sh
+      - name: Build ELF, FSELF and PKG
+        run: make -j"$(nproc)"
+      - name: Validate and extract PKG
         run: |
-          wget -O openorbis.tar.gz https://github.com/OpenOrbis/OpenOrbis-PS4-Toolchain/releases/download/v0.5.4/toolchain-llvm-18.tar.gz
-          mkdir -p openorbis
-          tar -xzf openorbis.tar.gz -C openorbis
-          mv openorbis/OpenOrbis/* openorbis/
-          echo "Estrutura do pacote OpenOrbis:"
-          ls -la openorbis
-          ls -la openorbis/bin 2>/dev/null || true
-          find openorbis/bin/linux -type f -exec chmod +x {} \; 2>/dev/null || true
-          echo "Verificando arquivos do OpenOrbis:"
-          echo "Verificando pastas de ferramentas:"
-          ls -la openorbis/PS4Toolchain/bin
-          ls -lah openorbis/PS4Toolchain/bin/linux/
-          find openorbis/PS4Toolchain -type f \( -name '*clang*' -o -name '*lld*' -o -name '*orbis*' \) -print
-          find openorbis -type f \( -name "clang++" -o -name "clang" \) -print
-          echo "Verificando arquivos de compilação:"
-          ls -l openorbis/PS4Toolchain/link.x 2>/dev/null || true
-          ls -l openorbis/PS4Toolchain/lib/libc.a 2>/dev/null || true
-          ls -l openorbis/PS4Toolchain/lib/libc++.a 2>/dev/null || true
-          echo "OO_PS4_TOOLCHAIN=$(pwd)/openorbis/PS4Toolchain" >> $GITHUB_ENV
-
-      - name: Build PkgTool.Core
-        run: |
-          git clone --depth 1 \
-            https://github.com/OpenOrbis/LibOrbisPkg.git pkgtool_src
-          cd pkgtool_src
-          dotnet build PkgTool.Core/PkgTool.Core.csproj \
-            --configuration Release \
-            --output ../pkgtool_bin \
-            -p:TargetFramework=net8.0
-          cd ..
-          PKGTOOL_DLL=$(find pkgtool_bin -name "PkgTool.Core.dll" | head -1)
-          echo "PKGTOOL_DLL=$PKGTOOL_DLL" >> $GITHUB_ENV
-
-      - name: Get fonts
-        run: |
-          mkdir -p assets/fonts
-          curl -sfL -o assets/fonts/NotoSans-Regular.ttf \
-            "https://github.com/google/fonts/raw/main/ofl/notosans/NotoSans-Regular.ttf" || true
-          curl -sfL -o assets/fonts/NotoSans-Bold.ttf \
-            "https://github.com/google/fonts/raw/main/ofl/notosans/NotoSans-Bold.ttf" || true
-          [ ! -s assets/fonts/NotoSans-Regular.ttf ] && \
-            cp /usr/share/fonts/truetype/dejavu/DejaVuSans.ttf assets/fonts/NotoSans-Regular.ttf || true
-          [ ! -s assets/fonts/NotoSans-Bold.ttf ] && \
-            cp /usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf assets/fonts/NotoSans-Bold.ttf || true
-
-      - name: Generate app icons
-        run: |
-          mkdir -p sce_sys
-          convert -size 228x128 gradient:'#0D0D1A-#1A0A30' \
-            -font DejaVu-Sans-Bold -pointsize 18 \
-            -fill '#9B4FFF' -annotate +14+42 'NEBULA HUB' \
-            -fill '#AAAACC' -pointsize 13 \
-            -annotate +14+62 'Avatar & Theme Library' \
-            sce_sys/icon0.png
-          convert -size 1920x1080 gradient:'#07071A-#0A0A20' \
-            -font DejaVu-Sans-Bold -pointsize 96 \
-            -fill '#7B2FFF' -gravity Center -annotate +0-100 'NEBULA HUB' \
-            -font DejaVu-Sans -pointsize 36 \
-            -fill '#6666AA' -gravity Center \
-            -annotate +0+20 'The Ultimate PS4 Customization Library' \
-            sce_sys/pic0.png
-          cp sce_sys/pic0.png sce_sys/bg0.png
-
-      - name: Compile NEBULA HUB ELF
-        run: |
-          OO="${{ env.OO_PS4_TOOLCHAIN }}"
-          CLANG="$(command -v clang++)" ; [ -n "$CLANG" ] || { echo "ERRO: clang++ não encontrado"; exit 1; }
-          LLD="$(command -v ld.lld)" ; [ -n "$LLD" ] || { echo "ERRO: ld.lld não encontrado"; exit 1; }
-
-          # Cross-compile with libc++ headers supplied by the Ubuntu runner.
-          # Ubuntu may install libc++ under a versioned LLVM directory.
-          LIBCXX_INCLUDE="$(find /usr/lib/llvm-*/include/c++/v1 /usr/include/c++/v1 -maxdepth 0 -type d 2>/dev/null | while read -r dir; do [ -f "$dir/string" ] && echo "$dir"; done | head -n 1)"
-          [ -n "$LIBCXX_INCLUDE" ] || { echo "ERRO: cabecalhos libc++ ausentes"; exit 1; }
-          echo "libc++ headers: $LIBCXX_INCLUDE"
-
-          CXXFLAGS="-target x86_64-pc-freebsd12-elf -fPIC -funwind-tables \
-                    -std=c++17 -O2 -D__ORBIS__ \
-                    -nostdinc++ -isystem $LIBCXX_INCLUDE \
-                    -include include/ps4_cpp_compat.h \
-                    -I$OO/include \
-                    -Iinclude \
-                    -Isrc"
-
-          echo "SDL2 stub headers in repo:"
-          ls include/SDL2/
-
-          SRCS="src/main.cpp src/db/database.cpp src/net/fetcher.cpp \
-                src/input/controller.cpp src/install/installer.cpp \
-                src/ui/renderer.cpp src/ui/screens.cpp"
-
-          OBJS=""
-          for src in $SRCS; do
-            obj="${src%.cpp}.o"
-            echo "Compiling $src..."
-            $CLANG $CXXFLAGS -c "$src" -o "$obj"
-            OBJS="$OBJS $obj"
-          done
-
-          $LLD -m elf_x86_64 --script "$OO/link.x" --eh-frame-hdr -pie \
-            -z max-page-size=0x4000 -z relro \
-            -L"$OO/lib" $OBJS \
-            -lSDL2_stub -lSDL2_image_stub -lSDL2_ttf_stub \
-            -lSceNet_stub -lSceHttp_stub -lSceSsl_stub \
-            -lScePad_stub -lSceUserService_stub \
-            -lSceSystemService_stub -lSceVideoOut_stub \
-            -lScePthread_stub -lkernel_stub \
-            -lc -lc++ -lc++abi \
-            -o eboot.elf
-          ls -lh eboot.elf
-
-      - name: Create FSELF
-        run: |
-          OO="${{ env.OO_PS4_TOOLCHAIN }}"
-          FSELF=""
-          for n in create-fself create_fself; do
-            [ -f "$OO/bin/linux/$n" ] && FSELF="$OO/bin/linux/$n" && break
-          done
-          chmod +x "$FSELF"
-          "$FSELF" -in eboot.elf -out eboot.bin \
-            --paid 0x3800000000000011 \
-            --npdrmtype fake --app \
-            --authinfo 0100000000000000F0000000FFD40000000000000000000000000000000000000000000000000000000800000000000000380000000000008000003800000000000000000000008000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000
-          ls -lh eboot.bin
-
-      - name: Build param.sfo
-        run: |
-          OO="${{ env.OO_PS4_TOOLCHAIN }}"
-          SFOTOOL=""
-          for n in sfo_tool sfo-tool; do
-            [ -f "$OO/bin/linux/$n" ] && SFOTOOL="$OO/bin/linux/$n" && break
-          done
-          if [ -n "$SFOTOOL" ]; then
-            chmod +x "$SFOTOOL"
-            "$SFOTOOL" --create \
-              --title "NEBULA HUB" \
-              --title-id "NEBU00001" \
-              --app-ver "01.00" \
-              sce_sys/param.sfo
-          else
-            dotnet "${{ env.PKGTOOL_DLL }}" sfo_new \
-              --title "NEBULA HUB" \
-              --title-id "NEBU00001" \
-              --app-ver "01.00" \
-              --sdk-ver "5050001" \
-              --category "gd" \
-              sce_sys/param.sfo
-          fi
-          ls -lh sce_sys/param.sfo
-
-      - name: Build PKG
-        run: |
-          OO="${{ env.OO_PS4_TOOLCHAIN }}"
-          GP4=""
-          for n in create-gp4 create_gp4; do
-            [ -f "$OO/bin/linux/$n" ] && GP4="$OO/bin/linux/$n" && break
-          done
-          chmod +x "$GP4"
-          "$GP4" -out project.gp4 \
-            --content-id "NEBU00001-NEBU00001_00-NEBULAHUB0000001" \
-            --app-path . \
-            --title-id "NEBU00001" \
-            --version "01.00"
-          dotnet "${{ env.PKGTOOL_DLL }}" pkg_build project.gp4 . nebulahub.pkg
-          echo "=============================="
-          echo "  PKG BUILT SUCCESSFULLY"
-          echo "=============================="
-          ls -lh nebulahub.pkg
-
-      - name: Upload PKG
-        uses: actions/upload-artifact@v4
+          make verify
+          sha256sum nebulahub.pkg > SHA256SUMS
+      - uses: actions/upload-artifact@v4
         with:
           name: nebulahub-pkg
-          path: nebulahub.pkg
+          path: |
+            nebulahub.pkg
+            SHA256SUMS
+          if-no-files-found: error
           retention-days: 90

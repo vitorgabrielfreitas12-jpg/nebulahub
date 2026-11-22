@@ -1,0 +1,4 @@
+/.deps/
+/build/
+/nebulahub.pkg
+__pycache__/
