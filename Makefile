@@ -1,6 +1,6 @@
 TITLE := NEBULA HUB
 TITLE_ID := NEBU00001
-VERSION := 01.02
+VERSION := 01.03
 CONTENT_ID := IV0000-NEBU00001_00-NEBULAHUB0000001
 OO_PS4_TOOLCHAIN ?= $(CURDIR)/.deps/OpenOrbis/PS4Toolchain
 SDL_TTF_SRC ?= .deps/SDL_ttf.c
@@ -18,7 +18,7 @@ STAGE := $(BUILD)/pkg
 CROSS := --target=x86_64-pc-freebsd12-elf --sysroot="$(SDK)" -nostdlibinc -fPIC -funwind-tables -D__ORBIS__ -D_GNU_SOURCE
 CXXFLAGS := $(CROSS) -isystem "$(SDK)/include/c++/v1" -isystem "$(SDK)/include" -I.deps -isystem "$(SDK)/include/SDL2" -std=c++17 -O2 -Wall -Wextra
 LDFLAGS := -m elf_x86_64 -pie --script "$(SDK)/link.x" --eh-frame-hdr -z max-page-size=0x4000 -L"$(SDK)/lib"
-LIBS := -lSDL2 -lSceFreeType -lSceUserService -lSceAppInstUtil -lSceVideoOut -lSceAudioOut -lScePad -lSceSysmodule -lSceNet -lSceHttp -lSceSsl -lc++ -lc++abi -lunwind -lc -lkernel
+LIBS := -lSDL2 -lSceFreeType -lSceUserService -lSceVideoOut -lSceAudioOut -lScePad -lSceSysmodule -lSceNet -lSceHttp -lSceSsl -lc++ -lc++abi -lunwind -lc -lkernel
 SOURCES := $(wildcard src/*.cpp src/*/*.cpp)
 OBJECTS := $(patsubst src/%.cpp,$(BUILD)/%.o,$(SOURCES)) $(BUILD)/SDL_ttf.o
 METADATA := sce_sys/param.sfo sce_sys/icon0.png
@@ -133,9 +133,10 @@ verify: nebulahub.pkg
 
 test: verify
 	convert -size 32x16 xc:purple "$(BUILD)/runtime-test.jpg"
+	convert -size 1920x1080 gradient:purple-orange "$(BUILD)/runtime-hd.jpg"
 	convert -size 16x16 xc:none PNG32:"$(BUILD)/runtime-alpha.png"
 	g++ -std=c++17 -O2 -Wall -Wextra -Isrc -I.deps -idirafter "$(SDK)/include" \
-	  tests/runtime.cpp src/db/database.cpp src/ui/image.cpp -pthread -l:libSDL2-2.0.so.0 -o "$(BUILD)/runtime-tests"
+	  tests/runtime.cpp src/db/database.cpp src/ui/image.cpp src/ui/preview_texture.cpp -pthread -l:libSDL2-2.0.so.0 -o "$(BUILD)/runtime-tests"
 	"$(BUILD)/runtime-tests" "$(BUILD)"
 	python3 -m unittest discover -s tests
 

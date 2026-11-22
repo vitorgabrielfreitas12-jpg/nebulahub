@@ -4,14 +4,12 @@
 #include <cstring>
 #include <cmath>
 #include <algorithm>
-#include "../diagnostics.h"
 
-Renderer::Renderer(SDL_Renderer* r) : sdl_(r) {}
+Renderer::Renderer(SDL_Renderer* r) : sdl_(r), previewTextures_(r) {}
 
 Renderer::~Renderer() {
     for (auto& [k, t] : textCache_) SDL_DestroyTexture(t);
     for (auto& [k, f] : fonts_) TTF_CloseFont(f);
-    for (auto& [k, t] : texCache_) SDL_DestroyTexture(t);
 }
 
 TTF_Font* Renderer::getFont(int size, bool bold) {
@@ -151,39 +149,6 @@ std::string Renderer::truncate(const std::string& str, int maxWidth, int size, b
         if (w <= maxWidth) return t;
     }
     return "…";
-}
-
-SDL_Texture* Renderer::loadTexture(const std::string& key, SDL_Surface* image) {
-    auto it = texCache_.find(key);
-    if (it != texCache_.end()) return it->second;
-    if (!image) return nullptr;
-    SDL_Texture* t = SDL_CreateTextureFromSurface(sdl_, image);
-    if (!t) diagnostic("preview", "Create texture", ErrorDomain::Application, 0, SDL_GetError());
-    if (texCache_.size() >= 24) {
-        SDL_DestroyTexture(texCache_.begin()->second);
-        texCache_.erase(texCache_.begin());
-    }
-    texCache_[key] = t;
-    return t;
-}
-
-void Renderer::drawTexture(SDL_Texture* tex, int x, int y, int w, int h, float alpha) {
-    if (!tex) return;
-    SDL_SetTextureAlphaMod(tex, (uint8_t)(255.f * alpha));
-    int sourceWidth = 0, sourceHeight = 0;
-    if (SDL_QueryTexture(tex, nullptr, nullptr, &sourceWidth, &sourceHeight) != 0 ||
-        sourceWidth <= 0 || sourceHeight <= 0) return;
-    const float scale = std::min(float(w) / sourceWidth, float(h) / sourceHeight);
-    const int width = int(sourceWidth * scale), height = int(sourceHeight * scale);
-    SDL_Rect r{x + (w - width) / 2, y + (h - height) / 2, width, height};
-    SDL_RenderCopy(sdl_, tex, nullptr, &r);
-}
-
-void Renderer::drawTextureRounded(SDL_Texture* tex, int x, int y, int w, int h,
-                                   int /*radius*/, float alpha) {
-    // Simple: just draw the texture, rounded corners are hard without stencils
-    // For PS4 SDL2 this is the pragmatic path
-    drawTexture(tex, x, y, w, h, alpha);
 }
 
 void Renderer::progressBar(int x, int y, int w, int h, float progress,

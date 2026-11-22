@@ -5,7 +5,7 @@
 // ─────────────────────────────────────────────
 
 #define APP_TITLE        "NEBULA HUB"
-#define APP_VERSION      "1.0.2"
+#define APP_VERSION      "1.0.3"
 #define TITLE_ID         "NEBU00001"
 
 #define SCREEN_W         1920

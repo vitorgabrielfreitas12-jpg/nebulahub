@@ -139,6 +139,8 @@ private:
     std::thread previewWorker_;
     std::unordered_map<std::string, Preview> thumbnails_;
     std::deque<std::string> thumbnailOrder_;
+    size_t thumbnailBytes_ = 0;
+    bool evictThumbnail(); // Called with qMu_ held.
     uint64_t generation_ = 0;
     RejectedDownload rejected_{REJECTED_DOWNLOAD};
     std::atomic<bool> keepRejected_{false};

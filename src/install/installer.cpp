@@ -1,45 +1,226 @@
-// NEBULA HUB — Installer
-// Avatar path: copy xavatar → /data/AVATARS/
-// Theme path: stage the PKG pair in /data/pkg/ and submit the stub.
-
 #include "installer.h"
 #include "package.h"
+#include "prepare.h"
+#include "service.h"
+#include "theme_progress.h"
 #include "../diagnostics.h"
 
 #include <orbis/AppInstUtil.h>
 #include <orbis/Sysmodule.h>
 #include <orbis/libkernel.h>
 
-#include <cstdio>
-#include <sys/stat.h>
+#include <algorithm>
+#include <array>
+#include <string_view>
+#include <type_traits>
+
+namespace {
+constexpr auto submitted = "Pedido enviado. Confira as notificações do PS4.";
+
+std::string logInstall(const char* operation, ErrorDomain domain, int code, const std::string& context) {
+    return diagnostic("installer", operation, domain, code, context.c_str(), true);
+}
+
+void logOperation(const char* operation, bool returned, int code, ErrorDomain domain,
+                  const std::string& context) {
+    const std::string name = std::string(operation) + (returned ? " returned" : " begin");
+    logInstall(name.c_str(), returned ? domain : ErrorDomain::Event, code, context);
+}
+
+std::string packageError(const std::string& path, uint64_t expected, PackageInfo& info,
+                         const std::string& context) {
+    logInstall("Validate PKG begin", ErrorDomain::Event, 0, context + " path=" + path);
+    const auto result = inspectPackageDetails(path, expected);
+    logInstall(result.reason, result.ioError ? ErrorDomain::Posix : ErrorDomain::Event,
+               result.ioError, context + " path=" + path + " " + describePackage(result, expected));
+    if (result) {
+        info = result.info;
+        return {};
+    }
+    switch (result.status) {
+        case PackageStatus::Missing: return "Baixe o pacote antes de instalar.";
+        case PackageStatus::Incomplete: return "Download incompleto. Não é possível instalar.";
+        case PackageStatus::Invalid: return "Arquivo PKG inválido ou incompatível.";
+        default: return result.ioError ? "Falha ao ler o PKG: " + std::string(strerror(result.ioError)) :
+                                        "Falha ao ler o PKG.";
+    }
+}
+
+std::string unsupportedType(const std::string& context) {
+    logInstall("PKG type or content ID mismatch", ErrorDomain::Application, 0, context);
+    return "Tipo ou identificador de PKG incompatível.";
+}
+
+std::string prepare(const std::string& source, const std::string& destination,
+                    const char* directory, const std::string& context) {
+    const auto detail = context + " destination=" + destination;
+    logInstall("Probe staging directory begin", ErrorDomain::Event, 0, detail);
+    const auto probe = probeDirectory(directory);
+    logInstall("Probe staging directory returned", ErrorDomain::Posix, probe.code, detail);
+    if (probe) return logInstall(probe.operation, ErrorDomain::Posix, probe.code, detail);
+    const auto staged = stagePackage(source, destination, [&](const char* operation, bool returned, int code) {
+        logOperation(operation, returned, code, ErrorDomain::Posix, detail);
+    });
+    if (staged) return logInstall(staged.operation, ErrorDomain::Posix, staged.code, detail);
+    return {};
+}
+
+static_assert(std::is_same_v<decltype(&sceAppInstUtilInitialize), AppInstInitialize>);
+static_assert(std::is_same_v<decltype(&sceAppInstUtilTerminate), AppInstInitialize>);
+static_assert(std::is_same_v<decltype(&sceAppInstUtilAppInstallPkg), AppInstSubmit>);
+
+struct AppInstModule {
+    OrbisKernelModule handle{};
+    OrbisKernelModuleInfo info{};
+    bool found = false;
+    int32_t error = 0;
+};
+
+AppInstModule findAppInstModule(const std::string& context) {
+    AppInstModule module;
+    std::array<OrbisKernelModule, 256> handles{};
+    size_t count = 0;
+    logInstall("sceKernelGetModuleList begin", ErrorDomain::Event, 0, context);
+    module.error = sceKernelGetModuleList(handles.data(), handles.size(), &count);
+    logInstall("sceKernelGetModuleList returned", ErrorDomain::Orbis, module.error,
+               context + " count=" + std::to_string(count));
+    if (module.error != 0) return module;
+
+    for (size_t i = 0; i < std::min(count, handles.size()); ++i) {
+        OrbisKernelModuleInfo info{};
+        info.size = sizeof(info);
+        const auto handle = " handle=" + std::to_string(handles[i]);
+        logInstall("sceKernelGetModuleInfo begin", ErrorDomain::Event, 0, context + handle);
+        const auto rc = sceKernelGetModuleInfo(handles[i], &info);
+        if (rc != 0) {
+            logInstall("sceKernelGetModuleInfo returned", ErrorDomain::Orbis, rc, context + handle);
+            continue;
+        }
+        const std::string_view name(info.name, strnlen(info.name, sizeof(info.name)));
+        const auto basename = name.substr(name.find_last_of('/') + 1);
+        logInstall("sceKernelGetModuleInfo returned", ErrorDomain::Orbis, rc,
+                   context + handle + " name=" + std::string(basename));
+        if (basename == "libSceAppInstUtil.sprx" || basename == "libSceAppInstUtil")
+            return {handles[i], info, true, 0};
+    }
+    logInstall("AppInstUtil absent from module list", ErrorDomain::Application, 0, context);
+    return module;
+}
+
+bool executableAddress(const OrbisKernelModuleInfo& module, const void* address) {
+    if (!address) return false;
+    const auto value = reinterpret_cast<uintptr_t>(address);
+    const auto count = std::min<size_t>(module.segmentCount, std::size(module.segmentInfo));
+    for (size_t i = 0; i < count; ++i) {
+        const auto& segment = module.segmentInfo[i];
+        const auto start = reinterpret_cast<uintptr_t>(segment.address);
+        if (start && (segment.prot & ORBIS_KERNEL_PROT_CPU_EXEC) &&
+            value >= start && value - start < segment.size) return true;
+    }
+    return false;
+}
+
+InstallResult launchPackage(const std::string& path, const std::string& context,
+                            const std::function<bool()>& beforeSubmit) {
+    const auto detail = context + " path=" + path;
+    AppInstModule module;
+    bool enumerated = false;
+    const InstallService service{
+        [&] {
+            static bool loaded = false;  // One Installer worker at a time. Keep the module resident.
+            if (loaded) {
+                logInstall("Use resident AppInstUtil module", ErrorDomain::Event, 0, detail);
+                return int32_t{0};
+            }
+            logInstall("sceSysmoduleLoadModuleInternal begin", ErrorDomain::Event, 0, detail);
+            const auto rc = static_cast<int32_t>(
+                sceSysmoduleLoadModuleInternal(ORBIS_SYSMODULE_INTERNAL_APP_INST_UTIL));
+            logInstall("sceSysmoduleLoadModuleInternal returned", ErrorDomain::Orbis, rc, detail);
+            loaded = rc >= 0;
+            return rc;
+        },
+        [&](const char* name) {
+            if (!enumerated) {
+                module = findAppInstModule(detail);
+                enumerated = true;
+            }
+            if (!module.found) return InstallSymbol{nullptr, module.error, false};
+            void* address = nullptr;
+            const auto rc = sceKernelDlsym(module.handle, name, &address);
+            const bool executable = rc == 0 && executableAddress(module.info, address);
+            if (rc == 0 && !executable)
+                logInstall(address ? "Resolved symbol outside executable segment" : "Resolved symbol address is null",
+                           ErrorDomain::Application, 0, detail + " symbol=" + name);
+            return InstallSymbol{address, rc, executable};
+        }
+    };
+    return requestPackage(service, path.c_str(), beforeSubmit,
+                          [&](const char* name, bool returned, int32_t rc) {
+        logOperation(name, returned, rc, ErrorDomain::Orbis, detail);
+    });
+}
+
+std::string installError(const InstallResult& result, const std::string& context) {
+    return logInstall(result.failure, result.code ? ErrorDomain::Orbis : ErrorDomain::Application,
+                      result.code, context);
+}
+
+std::string progressKey(const std::string& entry, const std::string& contentId) {
+    constexpr char hex[] = "0123456789abcdef";
+    std::string key = entry + ':';
+    for (const unsigned char byte : contentId) {
+        key += hex[byte >> 4];
+        key += hex[byte & 0xf];
+    }
+    return key;
+}
+
+void notifyAvatar(const char* message, const std::string& context) {
+    OrbisNotificationRequest request{};
+    request.type = NotificationRequest;
+    request.targetId = -1;
+    snprintf(request.message, sizeof(request.message), "NEBULA HUB: %s", message);
+    logInstall("Send avatar notification begin", ErrorDomain::Event, 0, context);
+    const auto rc = sceKernelSendNotificationRequest(0, &request, sizeof(request), 0);
+    logInstall("Send avatar notification returned", ErrorDomain::Orbis, rc, context);
+}
+}
 
 Installer::~Installer() {
     if (worker_.joinable()) worker_.join();
 }
 
-bool Installer::submit(ContentEntry entry) {
-    if (busy_) return false;
+bool Installer::submit(ContentEntry entry, InstallCommand command) {
+    if (busy_.exchange(true)) return false;
     if (worker_.joinable()) worker_.join();
-    busy_ = true;
     try {
-        worker_ = std::thread([this, entry = std::move(entry)] {
-            const auto done = [this, &entry](bool ok, const std::string& message) {
+        worker_ = std::thread([this, entry = std::move(entry), command] {
+            std::string result;
+            try {
+                const auto context = "entry=" + entry.id;
+                logInstall("Install requested", ErrorDomain::Event, 0,
+                           context + " action=" + std::to_string(static_cast<int>(command)));
+                if (command != InstallCommand::Request &&
+                    (entry.type != ContentType::Theme || entry.fileFormat != "pkg_split")) {
+                    result = "Esta ação exige um tema em duas partes.";
+                } else {
+                    result = entry.type == ContentType::Avatar ? installAvatar(entry) :
+                                                                 installTheme(entry, command);
+                }
+            } catch (const std::exception& error) {
+                result = logInstall("Installation worker failed", ErrorDomain::Application, 0,
+                                    entry.id + " " + error.what());
+            }
+            {
                 std::lock_guard<std::mutex> lock(mutex_);
                 resultId_ = entry.id;
-                result_ = ok && message.empty() ? "Pedido enviado. Confira as notificações do PS4." : message;
-            };
-            try {
-                diagnostic("installer", "Install requested", ErrorDomain::Event, 0, entry.id.c_str());
-                if (entry.type == ContentType::Avatar) installAvatar(entry, done);
-                else installTheme(entry, done);
-            } catch (const std::exception&) {
-                done(false, diagnostic("installer", "Installation worker failed", ErrorDomain::Application, EIO));
+                result_ = std::move(result);
             }
             busy_ = false;
         });
     } catch (const std::system_error& error) {
         busy_ = false;
-        diagnostic("installer", "Start worker", ErrorDomain::Posix, error.code().value());
+        logInstall("Start worker", ErrorDomain::Posix, error.code().value(), {});
         return false;
     }
     return true;
@@ -52,197 +233,103 @@ std::string Installer::takeResult(const std::string& id) {
     return result;
 }
 
-bool Installer::copyFile(const std::string& src, const std::string& dst) {
-    FILE* fin  = fopen(src.c_str(), "rb");
-    if (!fin) return false;
-    const std::string partial = dst + ".part";
-    FILE* fout = fopen(partial.c_str(), "wb");
-    if (!fout) { fclose(fin); return false; }
-
-    char buf[64 * 1024];
-    size_t n;
-    bool ok = true;
-    while ((n = fread(buf, 1, sizeof(buf), fin)) > 0) {
-        if (const auto failure = writeStorage(fout, buf, n)) { errno = failure.code; ok = false; break; }
-    }
-    ok = ok && !ferror(fin);
-    fclose(fin);
-    if (fclose(fout) != 0) ok = false;
-    if (ok) ok = rename(partial.c_str(), dst.c_str()) == 0;
-    if (!ok) remove(partial.c_str());
-    return ok;
-}
-
-// ─────────────────────────────────────────────
-//  Avatar install
-// ─────────────────────────────────────────────
-
-namespace {
-std::string packageError(const std::string& path, uint64_t expected, PackageInfo& info) {
-    const auto result = inspectPackageDetails(path, expected);
-    const auto context = path + " " + describePackage(result, expected);
-    diagnostic("installer", result.reason, result.ioError ? ErrorDomain::Posix : ErrorDomain::Event,
-               result.ioError, context.c_str());
-    if (result) {
-        info = result.info;
-        return {};
-    }
-    switch (result.status) {
-        case PackageStatus::Missing: return "Baixe o pacote antes de instalar.";
-        case PackageStatus::Incomplete: return "Download incompleto. Não é possível instalar.";
-        case PackageStatus::Invalid: return "Arquivo PKG inválido ou incompatível.";
-        default: return result.ioError ? "Falha ao ler o PKG: " + std::string(strerror(result.ioError)) : "Falha ao ler o PKG.";
-    }
-}
-
-std::string unsupportedType(const std::string& path) {
-    diagnostic("installer", "Unsupported package type", ErrorDomain::Application, 0, path.c_str());
-    return "Tipo de PKG incompatível.";
-}
-}
-
-bool Installer::installAvatar(const ContentEntry& entry,
-                               std::function<void(bool,std::string)> cb) {
-    if (entry.localPath.empty()) {
-        cb(false, "File not downloaded");
-        return false;
-    }
-
+std::string Installer::installAvatar(const ContentEntry& entry) {
+    const auto context = "entry=" + entry.id;
+    if (entry.localPath.empty()) return "Baixe o arquivo antes de instalar.";
     if (entry.fileFormat == "xavatar_fpkg") {
-        // This is a BULK FPKG (F1nnish pack) — we install it as a PKG
-        // then the user applies individual avatars from Avatar Changer
-        PackageInfo package;
-        auto error = packageError(entry.localPath, entry.fileSize, package);
-        if (error.empty() && package.type != 0x1a) error = unsupportedType(entry.localPath);
-        if (!error.empty()) {
-            cb(false, error);
-            return false;
-        }
-        bool ok = launchPkgInstall(entry.localPath, error);
-        if (ok) {
-            notify("NEBULA HUB",
-                   "Avatar pack submitted. Open Avatar Changer (LAPY) to apply.");
-            cb(true, "");
-        } else {
-            cb(false, error);
-        }
-        return ok;
+        PackageInfo info;
+        const auto error = packageError(entry.localPath, entry.fileSize, info, context);
+        if (!error.empty()) return error;
+        if (!matchesPackageRole(info, PackageRole::AvatarPack)) return unsupportedType(context);
+        const auto result = launchPackage(entry.localPath, context + " content_id=" + info.contentId,
+                                          [] { return true; });
+        if (!result.accepted) return installError(result, context);
+        notifyAvatar("Avatar pack submitted. After installation, open Avatar Changer (LAPY).", context);
+        return submitted;
     }
 
-    // Single .xavatar file → copy to /data/AVATARS/
-    std::string filename = entry.id + ".xavatar";
-    std::string dst = std::string(AVATAR_DEST) + filename;
-    struct stat info{};
-    if (entry.fileFormat != "xavatar" || !entry.fileSize ||
-        stat(entry.localPath.c_str(), &info) != 0 || !S_ISREG(info.st_mode) ||
-        static_cast<uint64_t>(info.st_size) != entry.fileSize) {
-        cb(false, diagnostic("installer", "Unsupported or incomplete avatar file", ErrorDomain::Application, 0, entry.localPath.c_str()));
-        return false;
-    }
-    bool ok = writableDirectory(AVATAR_DEST) && copyFile(entry.localPath, dst);
-    if (ok) {
-        notify("NEBULA HUB",
-               std::string("Avatar ready! Open Avatar Changer to apply ") + entry.name);
-        cb(true, dst);
-    } else {
-        cb(false, diagnostic("installer", "Copy avatar", ErrorDomain::Posix, errno, dst.c_str()));
-    }
-    return ok;
+    uint64_t bytes = 0;
+    FileInput input(entry.localPath.c_str());
+    if (entry.fileFormat != "xavatar" || !entry.fileSize || !input ||
+        !input.measure(bytes) || bytes != entry.fileSize)
+        return logInstall("Unsupported or incomplete avatar file", ErrorDomain::Application, 0, context);
+    const auto destination = std::string(AVATAR_DEST) + entry.id + ".xavatar";
+    const auto error = prepare(entry.localPath, destination, AVATAR_DEST, context);
+    if (!error.empty()) return error;
+    notifyAvatar("Avatar ready to apply in Avatar Changer.", context);
+    return "Avatar copiado. Abra o Avatar Changer para aplicá-lo.";
 }
 
-// ─────────────────────────────────────────────
-//  Theme install
-// ─────────────────────────────────────────────
-
-bool Installer::installTheme(const ContentEntry& entry,
-                              std::function<void(bool,std::string)> cb) {
+std::string Installer::installTheme(const ContentEntry& entry, InstallCommand command) {
+    const auto context = "entry=" + entry.id;
     if (entry.fileFormat == "pkg_theme") {
         PackageInfo info;
-        auto error = packageError(entry.localPath, entry.fileSize, info);
-        if (error.empty() && !isThemePayload(info))
-            error = unsupportedType(entry.localPath);
-        const bool accepted = error.empty() && launchPkgInstall(entry.localPath, error);
-        cb(accepted, error);
-        return accepted;
+        const auto error = packageError(entry.localPath, entry.fileSize, info, context);
+        if (!error.empty()) return error;
+        if (!isThemePayload(info)) return unsupportedType(context);
+        const auto result = launchPackage(entry.localPath, context + " content_id=" + info.contentId,
+                                          [] { return true; });
+        return result.accepted ? submitted : installError(result, context);
     }
-    if (entry.fileFormat != "pkg_split") {
-        cb(false, "Formato de tema incompatível.");
-        return false;
+    if (entry.fileFormat != "pkg_split") return "Formato de tema incompatível.";
+
+    ThemeProgress progress(DATA_DIR "theme-install.state");
+    if (command == InstallCommand::ClearProgress) {
+        logInstall("Clear local theme request state begin", ErrorDomain::Event, 0, context);
+        const auto rc = progress.clear();
+        logInstall("Clear local theme request state returned", ErrorDomain::Posix, rc, context);
+        return rc == 0 ? "Registro local limpo. Confira o estado do tema no PS4." :
+                         "Falha ao limpar o registro local. Consulte diagnostics.log.";
     }
 
     PackageInfo first, second;
-    auto error = packageError(entry.localStubPath, entry.stubSize, first);
-    if (!error.empty()) {
-        cb(false, "Parte 1: " + error);
-        return false;
-    }
-    error = packageError(entry.localPayloadPath, entry.payloadSize, second);
-    if (!error.empty()) {
-        cb(false, "Parte 2: " + error);
-        return false;
-    }
-    if (!isThemePair(first, second)) {
-        cb(false, unsupportedType(entry.localStubPath));
-        return false;
-    }
-    if (!writableDirectory(PKG_INSTALL_DIR, &error)) {
-        cb(false, error);
-        return false;
+    auto error = packageError(entry.localStubPath, entry.stubSize, first, context + " part=1");
+    if (!error.empty()) return "Parte 1: " + error;
+    error = packageError(entry.localPayloadPath, entry.payloadSize, second, context + " part=2");
+    if (!error.empty()) return "Parte 2: " + error;
+    if (!isThemePair(first, second)) return unsupportedType(context);
+
+    const auto key = progressKey(entry.id, first.contentId);
+    const bool confirmed = command == InstallCommand::ConfirmFirst;
+    const auto action = progress.next(key, confirmed);
+    switch (action) {
+        case ThemeAction::ConfirmFirst: return "Parte 1 pendente. Confirme no PS4 e pressione △ em Install.";
+        case ThemeAction::CheckSecond: return "Parte 2 já solicitada. Veja o resultado nas notificações do PS4.";
+        case ThemeAction::OtherTheme: return "Outro tema está pendente. Confira o PS4 antes de limpar o registro.";
+        case ThemeAction::Reset: return "Registro local ilegível. Confira o PS4 antes de limpá-lo.";
+        case ThemeAction::First: if (confirmed) return "Pressione ✕ em Install para solicitar a parte 1."; break;
+        case ThemeAction::Second: break;
     }
 
-    const auto pairKey = entry.id + ":" + first.contentId;
-    const bool secondPart = pendingTheme_ == pairKey;
-    const auto& source = secondPart ? entry.localPayloadPath : entry.localStubPath;
-    const auto staged = std::string(PKG_INSTALL_DIR) + entry.id + (secondPart ? "_2.pkg" : "_1.pkg");
-    if (!copyFile(source, staged)) {
-        cb(false, diagnostic("installer", "Stage theme component", ErrorDomain::Posix, errno, staged.c_str()));
-        return false;
-    }
-    error = packageError(staged, secondPart ? entry.payloadSize : entry.stubSize, secondPart ? second : first);
-    if (!error.empty() || !launchPkgInstall(staged, error)) {
-        cb(false, std::string(secondPart ? "Parte 2: " : "Parte 1: ") + error);
-        return false;
-    }
-    pendingTheme_ = secondPart ? "" : pairKey;
-    cb(true, secondPart ? "Parte 2 enviada. Confira as notificações do PS4."
-                        : "Parte 1 enviada. Aguarde a instalação no PS4 antes de selecionar Install novamente.");
-    return true;
-}
+    const bool partTwo = action == ThemeAction::Second;
+    const auto& source = partTwo ? entry.localPayloadPath : entry.localStubPath;
+    const auto& original = partTwo ? second : first;
+    const auto expected = partTwo ? entry.payloadSize : entry.stubSize;
+    const auto role = partTwo ? PackageRole::ThemePayload : PackageRole::ThemeFirst;
+    const auto detail = context + (partTwo ? " part=2" : " part=1") + " content_id=" + original.contentId;
+    const auto staged = std::string(PKG_INSTALL_DIR) + entry.id + (partTwo ? "_2.pkg" : "_1.pkg");
+    error = prepare(source, staged, PKG_INSTALL_DIR, detail);
+    if (!error.empty()) return error;
+    PackageInfo copy;
+    error = packageError(staged, expected, copy, detail + " staged=true");
+    if (!error.empty()) return error;
+    if (!matchesPackageRole(copy, role) || copy.contentId != original.contentId ||
+        copy.type != original.type || copy.iroTag != original.iroTag)
+        return unsupportedType(detail);
 
-// ─────────────────────────────────────────────
-//  PKG install trigger (same method as 4PT / FPKGi)
-// ─────────────────────────────────────────────
-
-bool Installer::launchPkgInstall(const std::string& pkgPath, std::string& error) {
-    int rc = sceSysmoduleLoadModuleInternal(ORBIS_SYSMODULE_INTERNAL_APP_INST_UTIL);
-    if (rc < 0) {
-        error = diagnostic("installer", "Load AppInstUtil module", ErrorDomain::Orbis, rc);
-        return false;
+    const auto result = requestThemePart(progress, key, partTwo, [&](const auto& beforeSubmit) {
+        return launchPackage(staged, detail, beforeSubmit);
+    }, [&](const char* operation, bool returned, int32_t value) {
+        if (returned) logOperation(operation, true, value, ErrorDomain::Posix, detail);
+        else logOperation(operation, false, 0, ErrorDomain::Event,
+                          detail + " phase=" + std::to_string(value));
+    });
+    if (!result.accepted) {
+        const auto failure = installError(result, detail);
+        if (result.submitReturned)
+            return "Pedido retornou erro. Confira o PS4 antes de limpar o registro.";
+        return failure;
     }
-    rc = sceAppInstUtilInitialize();
-    if (rc < 0) {
-        error = diagnostic("installer", "Initialize AppInstUtil", ErrorDomain::Orbis, rc);
-        return false;
-    }
-    diagnostic("installer", "Submit PKG", ErrorDomain::Event, 0, pkgPath.c_str());
-    rc = sceAppInstUtilAppInstallPkg(pkgPath.c_str(), nullptr);
-    const auto result = diagnostic("installer", rc < 0 ? "AppInstUtil rejected PKG" : "AppInstUtil accepted request",
-                                   ErrorDomain::Orbis, rc, pkgPath.c_str());
-    sceAppInstUtilTerminate();
-    if (rc < 0) error = result;
-    return rc >= 0;
-}
-
-// ─────────────────────────────────────────────
-//  Notification
-// ─────────────────────────────────────────────
-
-void Installer::notify(const std::string& title, const std::string& msg) {
-    // PS4 toast notification — same API used by most homebrews
-    OrbisNotificationRequest request{};
-    request.type = NotificationRequest;
-    request.targetId = -1;
-    snprintf(request.message, sizeof(request.message), "%s: %s", title.c_str(), msg.c_str());
-    sceKernelSendNotificationRequest(0, &request, sizeof(request), 0);
-    printf("[NEBULA HUB] %s: %s\n", title.c_str(), msg.c_str());
+    return partTwo ? "Parte 2 enviada. Confira o resultado nas notificações do PS4." :
+                     "Parte 1 enviada. Confirme a instalação no PS4 antes de pressionar △.";
 }

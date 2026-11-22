@@ -119,6 +119,7 @@ private:
     int            btnIdx_    = 0;  // 0=download, 1=install, 2=favorite
     std::string    statusMsg_;
     bool           downloading_ = false;
+    bool           clearInstallProgress_ = false;
 };
 
 class DownloadsScreen : public Screen {

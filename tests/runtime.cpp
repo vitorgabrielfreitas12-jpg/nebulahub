@@ -1,10 +1,13 @@
 #include "db/database.h"
 #include "install/package.h"
+#include "install/prepare.h"
+#include "install/theme_progress.h"
 #include "net/transfer.h"
 #include "net/fetcher.h"
 #include "net/url.h"
 #include "storage.h"
 #include "ui/image.h"
+#include "ui/preview_texture.h"
 
 #include <cassert>
 #include <chrono>
@@ -18,6 +21,190 @@ namespace fs = std::filesystem;
 static std::string read(const fs::path& path) {
     std::ifstream file(path, std::ios::binary);
     return {std::istreambuf_iterator<char>(file), {}};
+}
+
+namespace {
+struct MockInstaller {
+    static MockInstaller* current;
+    int32_t loadCode = 0;
+    int32_t initCode = 0;
+    int32_t submitCode = 0;
+    int32_t terminateCode = 0;
+    InstallSymbol override{};
+    std::string symbolOverride;
+    std::vector<std::string> operations;
+    std::string path;
+    int sends = 0;
+    bool interrupted = false;
+
+    static int32_t begin() {
+        current->operations.emplace_back("initialize");
+        return current->initCode;
+    }
+    static int32_t submit(const char* path, void* options) {
+        assert(path && !options);
+        current->operations.emplace_back("submit");
+        current->path = path;
+        ++current->sends;
+        if (current->interrupted) throw std::runtime_error("interrupted");
+        return current->submitCode;
+    }
+    static int32_t finish() {
+        current->operations.emplace_back("terminate");
+        return current->terminateCode;
+    }
+    InstallService service() {
+        current = this;
+        return {
+            [this] { operations.emplace_back("load"); return loadCode; },
+            [this](const char* name) {
+                if (name == symbolOverride) return override;
+                const std::string symbol(name);
+                if (symbol == "sceAppInstUtilInitialize") return InstallSymbol{reinterpret_cast<void*>(begin), 0, true};
+                if (symbol == "sceAppInstUtilTerminate") return InstallSymbol{reinterpret_cast<void*>(finish), 0, true};
+                assert(symbol == "sceAppInstUtilAppInstallPkg");
+                return InstallSymbol{reinterpret_cast<void*>(submit), 0, true};
+            }
+        };
+    }
+};
+MockInstaller* MockInstaller::current = nullptr;
+
+void checkInstaller(const fs::path& dir, const fs::path& downloaded, const std::string& bytes) {
+    const InstallTrace quiet = [](const char*, bool, int32_t) {};
+    const auto staged = (dir / "first.pkg").string();
+    assert(!stagePackage(downloaded.string(), staged, quiet));
+    assert(read(staged) == bytes && read(downloaded) == bytes);
+    assert(isCompletePackage(staged, bytes.size()));
+    assert(stagePackage((dir / "missing.pkg").string(), staged, quiet).code == ENOENT);
+    const auto failure = stagePackage(downloaded.string(), (dir / "downloads").string(), quiet);
+    assert(failure && std::string(failure.operation) == "publish staged package");
+    for (const auto& file : fs::directory_iterator(dir))
+        assert(file.path().filename().string().rfind("downloads.", 0) != 0);
+    assert(read(staged) == bytes && read(downloaded) == bytes);
+
+    MockInstaller mock;
+    const auto send = [&](const std::function<bool()>& before) {
+        return requestPackage(mock.service(), staged.c_str(), before, quiet);
+    };
+    const auto allow = [] { return true; };
+    mock.loadCode = -12;
+    assert(send(allow).code == -12 && mock.operations == std::vector<std::string>{"load"});
+    mock.loadCode = 0;
+    mock.symbolOverride = "sceAppInstUtilAppInstallPkg";
+    mock.override = {nullptr, -7, false};
+    assert(send(allow).code == -7 && mock.sends == 0);
+    mock.override = {nullptr, 0, true};
+    assert(send(allow).failure && mock.sends == 0);
+    mock.override = {reinterpret_cast<void*>(MockInstaller::submit), 0, false};
+    assert(send(allow).failure && mock.sends == 0);
+    mock.symbolOverride.clear();
+
+    mock.initCode = -31;
+    mock.operations.clear();
+    assert(send(allow).code == -31 && mock.sends == 0);
+    assert((mock.operations == std::vector<std::string>{"load", "initialize"}));
+    mock.initCode = 0;
+    mock.operations.clear();
+    assert(!send([] { return false; }).accepted && mock.sends == 0);
+    assert((mock.operations == std::vector<std::string>{"load", "initialize", "terminate"}));
+
+    const auto state = (dir / "install.state").string();
+    const std::string key = "azure:contentid";
+    ThemeProgress progress(state);
+    assert(progress.next(key, false) == ThemeAction::First);
+    mock.submitCode = -44;
+    const auto rejected = requestThemePart(progress, key, false, send, quiet);
+    assert(!rejected.accepted && rejected.submitReturned && rejected.code == -44 && mock.sends == 1);
+    ThemeProgress uncertain(state);
+    assert(uncertain.phase == ThemePhase::FirstRequested);
+    assert(uncertain.next(key, false) == ThemeAction::ConfirmFirst);
+    assert(uncertain.clear() == 0 && !fs::exists(state));
+    assert(fs::exists(downloaded) && read(downloaded) == bytes);
+
+    mock.submitCode = 0;
+    mock.terminateCode = -101;
+    assert(requestThemePart(progress, key, false, send, quiet).accepted && mock.sends == 2);
+    ThemeProgress restarted(state);
+    assert(restarted.phase == ThemePhase::FirstAccepted);
+    assert(restarted.next(key, false) == ThemeAction::ConfirmFirst);
+    assert(restarted.next("japanese-trade:contentid", true) == ThemeAction::OtherTheme);
+    assert(mock.sends == 2);
+    if (restarted.next(key, true) == ThemeAction::Second) {
+        const auto secondPath = (dir / "second.pkg").string();
+        assert(!stagePackage(downloaded.string(), secondPath, quiet));
+        const auto sendSecond = [&](const std::function<bool()>& before) {
+            return requestPackage(mock.service(), secondPath.c_str(), before, quiet);
+        };
+        assert(requestThemePart(restarted, key, true, sendSecond, quiet).accepted);
+        assert(mock.path == secondPath && mock.operations.back() == "terminate");
+    }
+    assert(mock.sends == 3 && ThemeProgress(state).next(key, true) == ThemeAction::CheckSecond);
+    assert(restarted.clear() == 0);
+
+    mock.interrupted = true;
+    try {
+        requestThemePart(restarted, key, false, send, quiet);
+        assert(false);
+    } catch (const std::runtime_error&) {
+        assert(mock.operations.back() == "terminate");
+    }
+    assert(ThemeProgress(state).phase == ThemePhase::FirstRequested);
+    assert(ThemeProgress(state).next(key, false) == ThemeAction::ConfirmFirst);
+    std::ofstream(state) << "corrupt";
+    assert(ThemeProgress(state).next(key, true) == ThemeAction::Reset);
+    assert(ThemeProgress(state).clear() == 0);
+}
+
+int rejectRenderCopy(SDL_Renderer*, SDL_Texture*, const SDL_Rect*, const SDL_Rect*) {
+    return SDL_SetError("simulated render failure");
+}
+
+void checkPreviewTextures(const fs::path& dir, const fs::path& hdJpeg) {
+    using Surface = std::unique_ptr<SDL_Surface, decltype(&SDL_FreeSurface)>;
+    auto worker = std::async(std::launch::async, [&] {
+        Surface decoded(loadPreviewFile(hdJpeg.string()), SDL_FreeSurface);
+        assert(decoded && decoded->w == 1920 && decoded->h == 1080);
+        return Surface(downsamplePreview(*decoded), SDL_FreeSurface);
+    });
+    const auto preview = worker.get();
+    assert(preview && preview->w == 768 && preview->h == 432);
+    const auto path = dir / "disk-cache.img";
+    std::ofstream(path, std::ios::binary) << read(hdJpeg);
+    Surface cached(loadPreviewFile(path.string()), SDL_FreeSurface);
+    assert(cached && cached->w == 1920);
+    std::ofstream(path, std::ios::binary) << "corrupted";
+    assert(!loadPreviewFile(path.string()));
+    assert(SDL_Init(0) == 0);
+    Surface target(SDL_CreateRGBSurfaceWithFormat(0, 640, 640, 32, SDL_PIXELFORMAT_RGBA32), SDL_FreeSurface);
+    assert(target);
+    std::unique_ptr<SDL_Renderer, decltype(&SDL_DestroyRenderer)> renderer(
+        SDL_CreateSoftwareRenderer(target.get()), SDL_DestroyRenderer);
+    assert(renderer);
+    {
+        PreviewTextures textures(renderer.get());
+        PreviewTextures unavailable(nullptr);
+        PreviewTextures cannotDraw(renderer.get(), rejectRenderCopy);
+        const SDL_Rect square{0, 0, 640, 640};
+        assert(SDL_SetRenderDrawColor(renderer.get(), 0, 0, 0, 255) == 0);
+        assert(SDL_RenderClear(renderer.get()) == 0);
+        assert(!textures.draw("no-preview", "file", nullptr, square));
+        assert(!unavailable.draw("no-renderer", "file", preview.get(), square));
+        assert(!cannotDraw.draw("cannot-draw", "file", preview.get(), square));
+        assert(textures.draw("theme", "file", preview.get(), square));
+        assert(textures.draw("theme", "file", nullptr, square)); // Cache hit.
+        assert(!textures.draw("theme", "different-file", nullptr, square));
+        SDL_RenderPresent(renderer.get());
+        const auto* pixels = static_cast<const unsigned char*>(target->pixels);
+        assert(pixels[0] == 0 && pixels[1] == 0 && pixels[2] == 0);
+        assert(pixels[target->pitch * 320 + 320 * 4] != 0);
+        for (int n = 0; n < 13; ++n)
+            assert(textures.draw(std::to_string(n), "file", preview.get(), square));
+        assert(!textures.draw("theme", "file", nullptr, square)); // Evicted.
+    }
+    renderer.reset();
+    SDL_Quit();
+}
 }
 
 int main(int argc, char** argv) {
@@ -124,6 +311,7 @@ int main(int argc, char** argv) {
     queue[0].state = DownloadState::Completed;
     const auto published = fs::path(downloads) / "first.pkg";
     std::ofstream(published, std::ios::binary).write(pkg.data(), pkg.size());
+    checkInstaller(dir, published, pkg);
     assert(beginNextDownload(queue).id == "second");
     cancelOrDismiss(queue, "first");
     assert(fs::exists(published) && queue.size() == 1);
@@ -157,6 +345,11 @@ int main(int argc, char** argv) {
     });
     assert(worker.get() == 6);
     const auto png = read(packaged / "av_pack_001.png");
+    assert(png == read(packaged / "av_pack_002.png") && png == read(packaged / "av_pack_003.png"));
+    const auto themeIcon = read(packaged / "th_horizon_zd_dyn.png");
+    assert(themeIcon != png && themeIcon == read(packaged / "th_ghost_tsushima_dyn.png") &&
+           themeIcon == read(packaged / "th_dark_souls_3_static.png"));
+    checkPreviewTextures(dir, build / "runtime-hd.jpg");
     SDL_Surface* decoded = loadPreviewFile((build / "runtime-test.jpg").string());
     assert(decoded && decoded->w == 32 && decoded->h == 16);
     SDL_FreeSurface(decoded);
@@ -186,6 +379,9 @@ int main(int argc, char** argv) {
                 file.path().extension() == ".headers") continue;
             auto* image = loadPreviewFile(file.path().string());
             assert(image && image->w == 1920 && image->h == 1080);
+            auto* prepared = downsamplePreview(*image);
+            assert(prepared && prepared->w == 768 && prepared->h == 432);
+            SDL_FreeSurface(prepared);
             SDL_FreeSurface(image);
             ++images;
         }
@@ -195,6 +391,12 @@ int main(int argc, char** argv) {
             const auto static2 = inspectPackageDetails((sources / "static_2").string(), 10616832);
             assert(static1 && static2 && isThemePair(static1.info, static2.info));
             puts("Both Dark Souls III static theme components accepted");
+        }
+        if (fs::exists(sources / "japanese_1") && fs::exists(sources / "japanese_2")) {
+            const auto japanese1 = inspectPackageDetails((sources / "japanese_1").string(), 1048576);
+            const auto japanese2 = inspectPackageDetails((sources / "japanese_2").string(), 19922944);
+            assert(japanese1 && japanese2 && isThemePair(japanese1.info, japanese2.info));
+            puts("Both 10 Images — 1800s Japanese Trade components accepted");
         }
         puts("Anime Pack, both Azure Earth components and all three live JPEG sources accepted");
     }
