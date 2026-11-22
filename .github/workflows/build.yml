@@ -17,7 +17,7 @@ jobs:
         run: |
           sudo apt-get update -y
           sudo apt-get install -y \
-            clang lld llvm \
+            clang lld llvm libc++-dev libc++abi-dev \
             python3 wget curl unzip git cmake make imagemagick \
             dotnet-sdk-8.0
 
@@ -92,9 +92,13 @@ jobs:
           CLANG="$(command -v clang++)" ; [ -n "$CLANG" ] || { echo "ERRO: clang++ não encontrado"; exit 1; }
           LLD="$(command -v ld.lld)" ; [ -n "$LLD" ] || { echo "ERRO: ld.lld não encontrado"; exit 1; }
 
+          # Cross-compile with libc++ headers supplied by the Ubuntu runner.
+          test -f /usr/include/c++/v1/string || { echo "ERRO: cabecalhos libc++ ausentes"; exit 1; }
+
           # Use our bundled SDL2 stub headers from include/SDL2/
           CXXFLAGS="-target x86_64-pc-freebsd12-elf -fPIC -funwind-tables \
                     -std=c++17 -O2 -D__ORBIS__ \
+                    -nostdinc++ -isystem /usr/include/c++/v1 \
                     -I$OO/include \
                     -Iinclude \
                     -Isrc"
