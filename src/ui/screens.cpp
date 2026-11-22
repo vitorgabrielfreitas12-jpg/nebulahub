@@ -12,7 +12,7 @@
 
 ScreenManager::ScreenManager(Renderer& gfx, Database& db, Fetcher& net,
                               Controller& ctrl, Installer& installer)
-    : ctx_{gfx, db, net, ctrl, installer} {}
+    : ctx_{gfx, db, net, ctrl, installer, [this](ScreenID id, void* param) { push(id, param); }} {}
 
 void ScreenManager::push(ScreenID id, void* param) {
     stack_.push_back(makeScreen(id, param));
@@ -84,11 +84,7 @@ void HomeScreen::update(ScreenCtx& ctx) {
         if (prev >= 0) selectedIdx_ = prev;
     }
     if (ctx.ctrl.pressed(PAD_BUTTON_CROSS)) {
-        // Push target screen (not for preview — no entry selected here)
-        // We re-use a push on the ScreenManager... but we don't have direct access
-        // The main loop will detect cross pressed on home; in a real impl the
-        // ScreenManager is passed as a ref or via callback. Here we store intent:
-        // (simplified — in production wire via callback lambda)
+        ctx.navigate(tiles_[selectedIdx_].target, nullptr);
     }
 }
 
