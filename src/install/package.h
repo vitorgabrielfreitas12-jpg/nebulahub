@@ -33,7 +33,10 @@ inline bool isCompletePackage(const std::string& path, uint64_t expected,
     const auto bodySize = readBE(0x28, 8);
     const auto pkgSize = readBE(0x430, 8);
     if (readBE(0, 4) != 0x7f434e54 || bodyOffset < 0x1000 || bodyOffset >= size ||
-        !bodySize || bodySize > size - bodyOffset || pkgSize != size) return false;
+        !bodySize || bodySize > size - bodyOffset) return false;
+    // Some retail packages omit the size field. Require the declared body to
+    // end at EOF in that case, in addition to the catalog size when supplied.
+    if (pkgSize ? pkgSize != size : bodySize != size - bodyOffset) return false;
     if (infoOut) {
         infoOut->contentId.assign(reinterpret_cast<const char*>(header + 0x40), 36);
         infoOut->type = static_cast<uint32_t>(readBE(0x74, 4));
