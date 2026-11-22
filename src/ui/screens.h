@@ -20,6 +20,7 @@ struct ScreenCtx {
     Fetcher&    net;
     Controller& ctrl;
     Installer&  installer;
+    std::function<void(ScreenID, void*)> navigate;
 };
 
 class Screen {
