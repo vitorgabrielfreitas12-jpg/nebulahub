@@ -23,8 +23,12 @@ jobs:
 
       - name: Get OpenOrbis PS4 Toolchain
         run: |
-          git clone --depth 1 \
-            https://github.com/OpenOrbis/OpenOrbis-PS4-Toolchain.git openorbis
+          wget -O openorbis.tar.gz https://github.com/OpenOrbis/OpenOrbis-PS4-Toolchain/releases/download/v0.5.4/toolchain-llvm-18.tar.gz
+          mkdir -p openorbis
+          tar -xzf openorbis.tar.gz -C openorbis
+          echo "Estrutura do pacote OpenOrbis:"
+          ls -la openorbis
+          ls -la openorbis/bin 2>/dev/null || true
           find openorbis/bin/linux -type f -exec chmod +x {} \; 2>/dev/null || true
           echo "Verificando arquivos do OpenOrbis:"
           find openorbis -type f \( -name "clang++" -o -name "clang" \) -print
