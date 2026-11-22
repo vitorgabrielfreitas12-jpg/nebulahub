@@ -32,8 +32,9 @@ jobs:
           ls -la openorbis/bin 2>/dev/null || true
           find openorbis/bin/linux -type f -exec chmod +x {} \; 2>/dev/null || true
           echo "Verificando arquivos do OpenOrbis:"
-          echo "Conteudo da pasta PS4Toolchain:"
-          find openorbis/PS4Toolchain -maxdepth 4 -type f | head -60
+          echo "Verificando pastas de ferramentas:"
+          ls -la openorbis/PS4Toolchain/bin
+          find openorbis/PS4Toolchain -type f \( -name '*clang*' -o -name '*lld*' -o -name '*orbis*' \) -print
           find openorbis -type f \( -name "clang++" -o -name "clang" \) -print
           echo "OO_PS4_TOOLCHAIN=$(pwd)/openorbis" >> $GITHUB_ENV
 
