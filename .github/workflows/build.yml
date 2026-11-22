@@ -37,7 +37,7 @@ jobs:
           ls -lah openorbis/PS4Toolchain/bin/linux/
           find openorbis/PS4Toolchain -type f \( -name '*clang*' -o -name '*lld*' -o -name '*orbis*' \) -print
           find openorbis -type f \( -name "clang++" -o -name "clang" \) -print
-          echo "OO_PS4_TOOLCHAIN=$(pwd)/openorbis" >> $GITHUB_ENV
+          echo "OO_PS4_TOOLCHAIN=$(pwd)/openorbis/PS4Toolchain" >> $GITHUB_ENV
 
       - name: Build PkgTool.Core
         run: |
